@@ -7,7 +7,7 @@
 运行时要求 Bun 1.3.14 或更高版本。在 OpenCode 的用户配置目录安装公开包：
 
 ```sh
-npm install @mingzzz/ocx-wechat-control
+npm install @mingzzz/ocx-wechat-control@0.1.1
 ```
 
 然后在 OpenCode 配置中启用插件，并关闭任何并行的 WeChat MCP 配置：
@@ -15,7 +15,7 @@ npm install @mingzzz/ocx-wechat-control
 ```json
 {
   "plugin": [
-    ["@mingzzz/ocx-wechat-control", { "enabled": true }]
+    ["@mingzzz/ocx-wechat-control@0.1.1", { "enabled": true }]
   ],
   "mcp": {
     "weixin": { "enabled": false }

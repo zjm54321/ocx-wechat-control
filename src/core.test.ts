@@ -9,7 +9,7 @@ import { ClientLifecycleRegistry, createCallbackHandler, extractPromptAssistant,
 import { CONTROL_OFF_TEXT, HELP_TEXT, PERMISSION_DENIED_TEXT, Store, formatOutbound, parseInboundText, parsePollToolResult } from "./core"
 import { runWorker } from "./worker"
 import { decideExistingBroker, pidStatus, readLock } from "./worker-runtime"
-import { ControlCommandHandled, captureRequestInputCallID, createControlCommandHook, createControlEventHook, createPermissionHook, executeRequestInputTool, registerControlCommands, requestInputToolOutcome, resolveWeixinCommand } from "./index"
+import { ControlCommandHandled, captureRequestInputCallID, createControlCommandHook, createControlEventHook, createPermissionHook, executeRequestInputTool, registerControlCommands, requestInputToolOutcome, resolveWeixinCommand } from "./plugin-runtime"
 
 const tempRoot = path.join(tmpdir(), "ocx-wechat-control-tests")
 mkdirSync(tempRoot, { recursive: true })
@@ -398,8 +398,8 @@ test("RPC rejects bad method, shared secret and instance token and reports live 
 	adapter.statusValue = "Degraded"; const live = await broker.handleRequest(authenticatedRequest("control-get", { rootSessionId: "root" })); expect((await live.json() as any).adapter).toBe("Degraded"); store.close()
 })
 
-test("published plugin entry remains metadata-only and adapter command is configurable", async () => {
-	const source = await Bun.file(new URL("./index.ts", import.meta.url)).text()
+test("plugin implementation remains metadata-only and adapter command is configurable", async () => {
+	const source = await Bun.file(new URL("./plugin-runtime.ts", import.meta.url)).text()
 	expect(source).toContain("event:"); expect(source).not.toContain("session.messages"); expect(source).toContain("observe-assistant"); expect(source).toContain("observe-status"); expect(source).not.toContain("C:\\\\Users")
 	expect(resolveWeixinCommand(["node", path.resolve("custom", "weixin-mcp", "dist", "cli.js")])[0]).toBe("node"); expect(() => resolveWeixinCommand(["npx", "weixin-mcp"])).toThrow()
 })

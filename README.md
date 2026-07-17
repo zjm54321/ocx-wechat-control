@@ -74,3 +74,7 @@ npm pack --dry-run
 ```
 
 测试只使用内存/临时 SQLite、fake MCP/client 和 `MockWeChatAdapter`；不会启动真实 worker、登录、poll 或发送微信。npm tarball 不包含源码测试、`node_modules`、状态库、WAL/SHM、日志、登录或 QR/cache 数据。
+
+## 维护者发布
+
+npm package settings 中的 Trusted Publisher 必须精确绑定 GitHub owner `zjm54321`、repository `ocx-wechat-control`、workflow filename `publish.yml`，Environment 留空。发布 `0.1.1` 时先把发布提交 push 到 `main`，再创建并 push `v0.1.1` tag；workflow 会校验 tag/version、tag commit 属于 `origin/main`，且 registry 中尚无同版本后才通过 OIDC 发布。

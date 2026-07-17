@@ -1,0 +1,93 @@
+name: Publish npm package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install OIDC-capable npm CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global npm@11.6.2
+          test "$(npm --version)" = "11.6.2"
+          npm config set registry https://registry.npmjs.org/ --location=user
+          npm config delete //registry.npmjs.org/:_authToken --location=user || true
+          npm config delete //registry.npmjs.org/:_authToken --location=project || true
+          if env | grep -Eq '^(NODE_AUTH_TOKEN|NPM_TOKEN)='; then
+            echo "::error::Token-based npm authentication is not allowed"
+            exit 1
+          fi
+          for config in "$HOME/.npmrc" "$GITHUB_WORKSPACE/.npmrc"; do
+            if test -f "$config" && grep -Eq '(^|:)_authToken[[:space:]]*=' "$config"; then
+              echo "::error::Registry _authToken configuration is not allowed"
+              exit 1
+            fi
+          done
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify release gates
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          package_name="$(node -p "require('./package.json').name")"
+          test "$RELEASE_TAG" = "v$version" || {
+            echo "::error::Tag must exactly match package version v$version"
+            exit 1
+          }
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::Tagged commit must be an ancestor of origin/main"
+            exit 1
+          }
+          if npm view "$package_name@$version" version --registry=https://registry.npmjs.org/ >/tmp/npm-view.out 2>/tmp/npm-view.err; then
+            echo "::error::$package_name@$version already exists on npm"
+            exit 1
+          fi
+          grep -q 'E404' /tmp/npm-view.err || {
+            echo "::error::Unable to confirm that the package version is unpublished"
+            exit 1
+          }
+
+      - name: Test and build
+        run: bun run check
+
+      - name: Inspect package contents
+        run: npm pack --dry-run --registry=https://registry.npmjs.org/
+
+      - name: Publish with trusted publishing
+        run: npm publish --access public --registry=https://registry.npmjs.org/

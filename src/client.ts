@@ -1,5 +1,5 @@
 import { readLock, authenticatedHealth, pidStatus } from "./worker-runtime"
-import { initializeState, isPlainText, type Binding } from "./core"
+import { initializeState, isPlainText } from "./core"
 import { makeRpcRequest } from "./broker"
 import * as path from "node:path"
 import { existsSync } from "node:fs"
@@ -43,7 +43,7 @@ export function createCallbackHandler(client: any, sharedSecret: string, instanc
 		if (request.method !== "POST") return Response.json({ error: "method" }, { status: 405 })
 		if (request.headers.get("x-wechat-control-key") !== sharedSecret || request.headers.get("x-wechat-instance-token") !== instanceToken) return Response.json({ error: "unauthorized" }, { status: 401 })
 		if (new URL(request.url).pathname === "/health") {
-			try { const body = await request.json() as any; if (body.rootSessionId) { const response = await client.session.get({ path: { id: body.rootSessionId } }); if (!response.data || response.data.parentID) return Response.json({ error: "not-root" }, { status: 409 }) }; return Response.json({ ok: true }) } catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
+			try { const body = await request.json() as any; if (body.rootSessionId) { const response = await client.session.get({ path: { id: body.rootSessionId } }); if (!response.data || response.data.id !== body.rootSessionId || response.data.parentID) return Response.json({ error: "not-root" }, { status: 409 }) }; return Response.json({ ok: true }) } catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
 		}
 		if (new URL(request.url).pathname !== "/inject") return Response.json({ error: "not-found" }, { status: 404 })
 		let stage = "request"
@@ -52,7 +52,7 @@ export function createCallbackHandler(client: any, sharedSecret: string, instanc
 			if (typeof body.rootSessionId !== "string" || typeof body.directory !== "string" || typeof body.text !== "string" || typeof body.inboundId !== "string" || !body.envelope || (body.envelope.kind !== "inbound" && (body.envelope.kind !== "checkpoint" || typeof body.envelope.checkpointId !== "string"))) return Response.json({ error: "bad-request" }, { status: 400 })
 			stage = "session"
 			const session = await client.session.get({ path: { id: body.rootSessionId } })
-			if (!session.data || session.data.parentID) return Response.json({ error: "not-root" }, { status: 409 })
+			if (!session.data || session.data.id !== body.rootSessionId || session.data.parentID) return Response.json({ error: "not-root" }, { status: 409 })
 			stage = "prompt"
 			const promptText = body.envelope.kind === "checkpoint" ? `[受限微信接管：异步检查点回答 ${body.envelope.checkpointId}]\n${body.text}` : body.text
 			const result = await client.session.prompt({ path: { id: body.rootSessionId }, query: { directory: body.directory }, body: { parts: [{ type: "text", text: promptText }] }, signal: request.signal })
@@ -90,8 +90,4 @@ export async function connectOrStartWorker(options: WorkerOptions): Promise<{ en
 	if (!lock || !(await authenticatedHealth(lock, state.secret))) throw new Error("broker did not become healthy")
 	const health = await makeRpcRequest(lock.endpoint, state.secret, { method: "health", challenge: lock.workerToken }); const body = await health.json() as any
 	return { endpoint: lock.endpoint, secret: state.secret, adapter: typeof body.adapter === "string" ? body.adapter : "unknown" }
-}
-
-export async function bindCurrent(endpoint: string, secret: string, instanceId: string, instanceToken: string, binding: Omit<Binding, "alias" | "contextToken" | "ownerInstance"> & { alias?: number }): Promise<any> {
-	return rpc(endpoint, secret, { method: "bind-current", instanceId, instanceToken, ...binding })
 }

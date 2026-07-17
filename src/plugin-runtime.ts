@@ -1,6 +1,6 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { bindCurrent, ClientLifecycleRegistry, connectOrStartWorker, requestInputRpc, resolveRootSession, rpc, startCallbackServer, type ClientLifecycle } from "./client"
-import { SerialQueue, sha256 } from "./core"
+import { ClientLifecycleRegistry, connectOrStartWorker, requestInputRpc, resolveRootSession, rpc, startCallbackServer, type ClientLifecycle } from "./client"
+import { sanitizeTitle, SerialQueue, sha256 } from "./core"
 import { createRequire } from "node:module"
 
 export function resolveWeixinCommand(value: unknown): string[] {
@@ -26,16 +26,25 @@ export function registerControlCommands(config: any): void {
 	}
 }
 
-export function createControlCommandHook(rpcCall: typeof rpc, toast: (enabled: boolean) => Promise<void>, endpoint: string, secret: string, instanceId: string, instanceToken: string) {
-	return async (input: { command: string; arguments: string }, output: { parts: unknown[] }) => {
+export function createControlCommandHook(rpcCall: typeof rpc, toast: (enabled: boolean, alias?: number) => Promise<void>, endpoint: string, secret: string, instanceId: string, instanceToken: string, sessionGet?: (sessionId: string) => Promise<any>, directory = "") {
+	return async (input: { command: string; arguments: string; sessionID?: string }, output: { parts: unknown[] }) => {
 		if (input.command !== "leave" && input.command !== "back") return
 		output.parts.splice(0)
 		if (input.arguments.trim()) throw new ControlCommandHandled(`/${input.command} 不接受参数。`)
 		const enabled = input.command === "leave"
-		try { await rpcCall(endpoint, secret, { method: "control-set", instanceId, instanceToken, enabled }) }
+		let alias: number | undefined
+		try {
+			if (enabled) {
+				if (!input.sessionID || !sessionGet) throw new Error("missing-session")
+				const response = await sessionGet(input.sessionID), session = response?.data
+				if (!session || session.parentID || session.id !== input.sessionID) throw new Error("not-root")
+				const result = await rpcCall(endpoint, secret, { method: "leave-root", instanceId, instanceToken, rootSessionId: input.sessionID, directory, title: sanitizeTitle(session.title) })
+				alias = result.binding.alias
+			} else await rpcCall(endpoint, secret, { method: "back-global", instanceId, instanceToken })
+		}
 		catch { throw new ControlCommandHandled("微信接管状态更新失败；命令已拦截，未发送给模型。") }
-		try { await toast(enabled) } catch {}
-		throw new ControlCommandHandled(enabled ? "受限微信接管已启用。" : "受限微信接管已关闭。")
+		try { await toast(enabled, alias) } catch {}
+		throw new ControlCommandHandled(enabled ? `已登记 #${alias}，微信输入 id 可查看会话。` : "受限微信接管已关闭。")
 	}
 }
 
@@ -93,7 +102,7 @@ export const WeChatControlPlugin: Plugin = async ({ client, directory }, options
 	await registry.replace(directory, lifecycle)
 	const auth = { instanceId, instanceToken }
 	const root = (sessionID: string) => resolveRootSession(client, sessionID)
-	const commandHook = createControlCommandHook(rpc, async (enabled) => { await client.tui.showToast({ query: { directory }, body: { title: "WeChat Control", message: enabled ? "受限微信接管已启用" : "受限微信接管已关闭", variant: enabled ? "success" : "info" } }) }, worker.endpoint, worker.secret, instanceId, instanceToken)
+	const commandHook = createControlCommandHook(rpc, async (enabled, alias) => { await client.tui.showToast({ query: { directory }, body: { title: "WeChat Control", message: enabled ? `已登记 #${alias}，微信输入 id 可查看会话` : "受限微信接管已关闭", variant: enabled ? "success" : "info" } }) }, worker.endpoint, worker.secret, instanceId, instanceToken, (sessionID) => client.session.get({ path: { id: sessionID } }), directory)
 	const permissionHook = createPermissionHook(root, rpc, worker.endpoint, worker.secret, instanceId, instanceToken)
 	const eventHook = createControlEventHook(rpc, worker.endpoint, worker.secret, instanceId, instanceToken)
 
@@ -102,16 +111,11 @@ export const WeChatControlPlugin: Plugin = async ({ client, directory }, options
 		"command.execute.before": commandHook,
 		"tool.execute.before": async (input: any, output: any) => { captureRequestInputCallID(input, output) },
 		tool: {
-			wechat_bind_session: tool({ description: "Bind this current root OpenCode session to an explicitly supplied stable conversation ID.", args: { conversationId: tool.schema.string().min(1).max(200), alias: tool.schema.number().int().positive().optional() }, async execute(args, context) {
-				const status = await rpc(worker.endpoint, worker.secret, { method: "status", ...auth }); if (status.adapter !== "Ready") return `拒绝：WeChat adapter 当前为 ${status.adapter}。`
-				const current = await client.session.get({ path: { id: context.sessionID } }); if (current.data?.parentID) return "拒绝：只能从 root session 绑定。"
-				const result = await bindCurrent(worker.endpoint, worker.secret, instanceId, instanceToken, { rootSessionId: context.sessionID, directory, conversationId: args.conversationId, alias: args.alias }); return `已绑定会话 #${result.binding.alias}；adapter=${worker.adapter}。`
-			} }),
 			wechat_request_input: tool({ description: "Asynchronously send one restricted takeover checkpoint to the bound WeChat conversation. The answer arrives as a later, new turn; call once and then end this turn.", args: { question: tool.schema.string().min(1).max(1500), choices: tool.schema.array(tool.schema.string().min(1).max(120)).max(8).optional() }, async execute(args, context) {
 				return executeRequestInputTool(args, context, async (requestKey) => { const rootSessionId = await root(context.sessionID); return requestInputRpc(worker.endpoint, worker.secret, { method: "request-input", ...auth, rootSessionId, requestKey, question: args.question, choices: args.choices ?? [] }) })
 			} }),
 			wechat_send_text: tool({ description: "Restricted compatibility tool; arbitrary/manual sends are disabled.", args: { text: tool.schema.string().min(1).max(4000) }, async execute() { return "拒绝：仅允许受限接管状态机产生的固定或关联外发。" } }),
-			wechat_control_status: tool({ description: "Report broker, adapter and takeover state without sending or polling.", args: {}, async execute(_args, context) { const rootSessionId = await root(context.sessionID); const status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); return `broker=Ready adapter=${status.adapter} takeover=${status.enabled ? "on" : "off"} routable=${status.routable}` } }),
+			wechat_control_status: tool({ description: "Report registration, global route and takeover state without sending or polling.", args: {}, async execute(_args, context) { const rootSessionId = await root(context.sessionID); const status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); return `broker=Ready adapter=${status.adapter} takeover=${status.enabled ? "on" : "off"} registered=${status.registered} alias=${status.alias ?? "none"} route=${status.routeReady ? "ready" : "missing"}` } }),
 		},
 		"experimental.chat.system.transform": async (input: any, output: { system: string[] }) => {
 			if (!input.sessionID) return

@@ -6,7 +6,10 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 export const MAX_TEXT_LENGTH = 4000
+export const MAX_ROUTE_ID_LENGTH = 500
+export const MAX_CONTEXT_TOKEN_LENGTH = 4000
 export const HELP_TEXT = "用法：首行 #编号，下一行输入正文。"
+export const UNKNOWN_TITLE = "未命名会话"
 export const OFFLINE_TEXT = "目标 OpenCode 会话当前离线，请稍后重试。"
 export const CONTROL_OFF_TEXT = "微信接管当前已关闭；发送 help 查看用法。"
 export const PERMISSION_DENIED_TEXT = "OpenCode 需要本地权限确认；受限微信接管已拒绝该权限请求。"
@@ -18,6 +21,7 @@ export const OUTBOUND_ECHO_TTL_MS = 10 * 60_000
 
 export type ParsedInbound =
 	| { ok: true; kind: "help" }
+	| { ok: true; kind: "list" }
 	| { ok: true; kind: "route"; alias: number; body: string }
 	| { ok: false; reason: "empty" | "invalid-route" | "invalid-text" }
 
@@ -29,6 +33,7 @@ export function parseInboundText(input: string): ParsedInbound {
 	const text = input.replace(/\r\n?/g, "\n")
 	if (!isPlainText(text)) return { ok: false, reason: text.length ? "invalid-text" : "empty" }
 	if (text.trim() === "help") return { ok: true, kind: "help" }
+	if (text.trim() === "id" && !/[\r\n]/.test(text)) return { ok: true, kind: "list" }
 	const match = /^#([1-9][0-9]*)[ \t]*(?:\n|$)/.exec(text)
 	if (!match) return { ok: false, reason: "invalid-route" }
 	const body = text.slice(match[0].length)
@@ -93,8 +98,36 @@ export interface Binding {
 	rootSessionId: string
 	directory: string
 	ownerInstance: string
-	conversationId: string
-	contextToken: string | null
+	title: string | null
+}
+
+export interface GlobalRoute { conversationId: string | null; contextToken: string | null; updatedAt: string | null }
+export type RoutedBinding = Binding & { conversationId: string; contextToken: string }
+export type RouteAcceptance = "CLAIMED" | "REFRESHED" | "REJECTED"
+
+export function isValidRouteMetadata(conversationId: unknown, contextToken: unknown): conversationId is string {
+	return typeof conversationId === "string" && conversationId.length > 0 && conversationId.length <= MAX_ROUTE_ID_LENGTH && typeof contextToken === "string" && contextToken.length > 0 && contextToken.length <= MAX_CONTEXT_TOKEN_LENGTH
+}
+
+export function sanitizeTitle(value: unknown): string | null {
+	if (typeof value !== "string") return null
+	const clean = Array.from(value.replace(/[\u0000-\u001f\u007f]/g, " ").trim()).slice(0, 120).join("").trim()
+	return clean || null
+}
+
+export function formatRegistrationList(bindings: Binding[]): string {
+	const ordered = [...bindings].sort((a, b) => a.alias - b.alias)
+	if (!ordered.length) return "暂无已登记会话。"
+	const lines: string[] = []
+	for (let index = 0; index < ordered.length; index++) {
+		const line = `#${ordered[index].alias}  ${ordered[index].title ?? UNKNOWN_TITLE}`
+		const remaining = ordered.length - index
+		if ([...lines, line].join("\n").length <= MAX_TEXT_LENGTH) { lines.push(line); continue }
+		let suffix = `……另有 ${remaining} 个会话未显示。`
+		while (lines.length && [...lines, suffix].join("\n").length > MAX_TEXT_LENGTH) { lines.pop(); suffix = `……另有 ${ordered.length - lines.length} 个会话未显示。` }
+		lines.push(suffix.slice(0, MAX_TEXT_LENGTH)); break
+	}
+	return lines.join("\n")
 }
 
 export interface PendingReply {
@@ -127,11 +160,11 @@ export class Store {
 	}
 	private migrate(databasePath: string): string | undefined {
 		const userVersion = (this.db.query("PRAGMA user_version").get() as any)?.user_version ?? 0
-		if (userVersion > 4) throw new Error("unsupported database schema")
+		if (userVersion > 5) throw new Error("unsupported database schema")
 		const has = (table: string) => Boolean(this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table))
 		const hasLegacyData = has("bindings") || has("inbound") || has("outbound")
 		let snapshot: string | undefined
-		if (databasePath !== ":memory:" && userVersion < 4 && (userVersion > 0 || hasLegacyData)) {
+		if (databasePath !== ":memory:" && userVersion < 5 && (userVersion > 0 || hasLegacyData)) {
 			snapshot = this.createConsistentSnapshot(databasePath)
 			this.migrationSnapshotInProgress = snapshot
 			this.options.onSnapshot?.(snapshot)
@@ -189,16 +222,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 			add("outbound_echoes", "context_token", "TEXT NOT NULL DEFAULT ''"); add("outbound_echoes", "expires_ms", "INTEGER NOT NULL DEFAULT 0")
 			this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoint_request_key ON checkpoints(request_key); CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoint_active_root ON checkpoints(root_session_id) WHERE state IN ('SENDING','OPEN','ANSWERING')")
 			this.db.query("INSERT OR IGNORE INTO control_state(singleton,enabled,revision) VALUES(1,0,0)").run()
-			this.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','4')").run()
-			this.db.exec("PRAGMA user_version=4")
+			if (userVersion < 5 && has("bindings") && columns("bindings").has("conversation_id")) {
+				const conversations = this.db.query("SELECT DISTINCT conversation_id AS id FROM bindings WHERE conversation_id<>''").all() as Array<{ id: string }>
+				this.db.exec("ALTER TABLE bindings RENAME TO bindings_pre_v5")
+				this.db.exec("CREATE TABLE bindings(alias INTEGER PRIMARY KEY AUTOINCREMENT,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)")
+				this.db.exec("INSERT INTO bindings(alias,root_session_id,directory,owner_instance,title,created_at,updated_at) SELECT alias,root_session_id,directory,owner_instance,NULL,created_at,created_at FROM bindings_pre_v5")
+				this.db.exec("DROP TABLE bindings_pre_v5")
+				this.db.exec("CREATE TABLE IF NOT EXISTS global_route(singleton INTEGER PRIMARY KEY CHECK(singleton=1),conversation_id TEXT,context_token TEXT,updated_at TEXT)")
+				this.db.query("INSERT OR IGNORE INTO global_route(singleton,conversation_id,context_token,updated_at) VALUES(1,?,NULL,?)").run(conversations.length === 1 ? conversations[0].id : null, conversations.length === 1 ? new Date().toISOString() : null)
+				if (conversations.length > 1) {
+					const now = new Date().toISOString()
+					this.db.query("UPDATE global_route SET conversation_id=NULL,context_token=NULL,updated_at=NULL WHERE singleton=1").run()
+					this.db.query("UPDATE control_state SET enabled=0,revision=revision+1 WHERE singleton=1 AND enabled<>0").run()
+					this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now)
+					this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=?").run(now)
+					this.db.query("UPDATE inbound SET state='UNKNOWN',reason='migration-multiple-global-routes',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE state='WAITING')").run(now)
+					this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state='WAITING'").run(now)
+					this.db.query("INSERT INTO audit(at,reason) VALUES(?,?)").run(now, "migration-multiple-global-routes")
+				}
+			} else {
+				this.db.exec("CREATE TABLE IF NOT EXISTS global_route(singleton INTEGER PRIMARY KEY CHECK(singleton=1),conversation_id TEXT,context_token TEXT,updated_at TEXT)")
+				this.db.query("INSERT OR IGNORE INTO global_route(singleton,conversation_id,context_token,updated_at) VALUES(1,NULL,NULL,NULL)").run()
+			}
+			this.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','5')").run()
+			this.db.exec("PRAGMA user_version=5")
 		})()
 		return snapshot
 	}
 	private createConsistentSnapshot(databasePath: string): string {
-		const backup = `${databasePath}.pre-v4-${Date.now()}-${crypto.randomUUID()}.bak`, temp = `${backup}.tmp`
+		const backup = `${databasePath}.pre-v5-${Date.now()}-${crypto.randomUUID()}.bak`, temp = `${backup}.tmp`
 		const escaped = temp.replaceAll("'", "''")
 		try { this.db.exec(`VACUUM INTO '${escaped}'`); renameSync(temp, backup); return backup }
-		catch (error) { if (existsSync(temp)) try { unlinkSync(temp) } catch {}; throw new Error(`consistent pre-v4 snapshot failed: ${error instanceof Error ? error.message : String(error)}`) }
+		catch (error) { if (existsSync(temp)) try { unlinkSync(temp) } catch {}; throw new Error(`consistent pre-v5 snapshot failed: ${error instanceof Error ? error.message : String(error)}`) }
 	}
 	private failMigration(error: unknown, snapshot?: string): never {
 		this.db.close()
@@ -237,39 +292,60 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 		const row = this.db.query("SELECT endpoint,instance_token AS instanceToken,heartbeat_ms AS heartbeat FROM instances WHERE instance_id=?").get(instanceId) as { endpoint: string; instanceToken: string; heartbeat: number } | null
 		return row ? { endpoint: row.endpoint, instanceToken: row.instanceToken, online: Date.now() - row.heartbeat <= INSTANCE_TTL_MS } : undefined
 	}
-	bind(input: Omit<Binding, "alias" | "contextToken"> & { alias?: number }): Binding {
-		const existing = this.db.query("SELECT alias,conversation_id AS conversationId,context_token AS contextToken,owner_instance AS ownerInstance FROM bindings WHERE root_session_id=?").get(input.rootSessionId) as { alias: number; conversationId: string; contextToken: string | null; ownerInstance: string } | null
-		const alias = input.alias ?? existing?.alias ?? (this.db.query("SELECT COALESCE(MAX(alias),0)+1 AS alias FROM bindings").get() as { alias: number }).alias
-		if (!Number.isSafeInteger(alias) || alias < 1 || !input.conversationId.trim()) throw new Error("invalid binding")
-		const contextToken = existing?.conversationId === input.conversationId ? existing.contextToken : null
-		this.db.query("INSERT INTO bindings(alias,root_session_id,directory,owner_instance,conversation_id,context_token,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(root_session_id) DO UPDATE SET alias=excluded.alias,directory=excluded.directory,owner_instance=excluded.owner_instance,conversation_id=excluded.conversation_id,context_token=excluded.context_token").run(alias, input.rootSessionId, input.directory, input.ownerInstance, input.conversationId, contextToken, new Date().toISOString())
-		if (existing && (existing.alias !== alias || existing.conversationId !== input.conversationId || existing.ownerInstance !== input.ownerInstance)) this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(new Date().toISOString(), input.rootSessionId)
-		return this.bindingForRoot(input.rootSessionId)!
+	bind(input: { rootSessionId: string; directory: string; ownerInstance: string; title?: string | null; alias?: number }): Binding {
+		if (input.alias !== undefined) throw new Error("manual alias is deprecated")
+		const now = new Date().toISOString(), title = sanitizeTitle(input.title)
+		let binding: Binding | undefined
+		this.db.transaction(() => {
+			const existing = this.bindingForRoot(input.rootSessionId)
+			if (existing) {
+				if (existing.ownerInstance !== input.ownerInstance && this.instance(existing.ownerInstance)?.online) throw new Error("owner-live")
+				this.db.query("UPDATE bindings SET directory=?,owner_instance=?,title=?,updated_at=? WHERE root_session_id=?").run(input.directory, input.ownerInstance, title, now, input.rootSessionId)
+				if (existing.ownerInstance !== input.ownerInstance) { this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, input.rootSessionId); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,owner_instance=?,updated_at=? WHERE root_session_id=?").run(input.ownerInstance, now, input.rootSessionId); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='owner-rebound',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, input.rootSessionId); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, input.rootSessionId) }
+			} else this.db.query("INSERT INTO bindings(root_session_id,directory,owner_instance,title,created_at,updated_at) VALUES(?,?,?,?,?,?)").run(input.rootSessionId, input.directory, input.ownerInstance, title, now, now)
+			this.db.query("UPDATE control_state SET enabled=1,revision=revision+1 WHERE singleton=1 AND enabled=0").run()
+			binding = this.bindingForRoot(input.rootSessionId)
+		})()
+		return binding!
 	}
-	bindingForAlias(alias: number): Binding | undefined { return this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,conversation_id AS conversationId,context_token AS contextToken FROM bindings WHERE alias=?").get(alias) as Binding | undefined }
-	bindingForRoot(root: string): Binding | undefined { return this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,conversation_id AS conversationId,context_token AS contextToken FROM bindings WHERE root_session_id=?").get(root) as Binding | undefined }
-	updateContext(alias: number, token: string): void {
-		const binding = this.bindingForAlias(alias); if (!binding) return
-		this.db.query("UPDATE bindings SET context_token=? WHERE conversation_id=?").run(token, binding.conversationId)
+	bindingForAlias(alias: number): Binding | undefined { return (this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title FROM bindings WHERE alias=?").get(alias) as Binding | null) ?? undefined }
+	bindingForRoot(root: string): Binding | undefined { return (this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title FROM bindings WHERE root_session_id=?").get(root) as Binding | null) ?? undefined }
+	bindings(): Binding[] { return this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title FROM bindings ORDER BY alias").all() as Binding[] }
+	refreshRoute(conversationId: string, contextToken: string): void { this.db.query("UPDATE global_route SET conversation_id=?,context_token=?,updated_at=? WHERE singleton=1").run(conversationId, contextToken, new Date().toISOString()) }
+	route(): GlobalRoute { return this.db.query("SELECT conversation_id AS conversationId,context_token AS contextToken,updated_at AS updatedAt FROM global_route WHERE singleton=1").get() as GlobalRoute }
+	acceptInboundRoute(conversationId: string, contextToken: string, allowInitialClaim: boolean): RouteAcceptance {
+		if (!isValidRouteMetadata(conversationId, contextToken)) return "REJECTED"
+		return this.db.transaction(() => {
+			const route = this.route(), now = new Date().toISOString()
+			if (route.conversationId === null) {
+				if (!allowInitialClaim) return "REJECTED"
+				const claimed = this.db.query("UPDATE global_route SET conversation_id=?,context_token=?,updated_at=? WHERE singleton=1 AND conversation_id IS NULL").run(conversationId, contextToken, now)
+				return claimed.changes === 1 ? "CLAIMED" : "REJECTED"
+			}
+			if (route.conversationId !== conversationId) return "REJECTED"
+			this.db.query("UPDATE global_route SET context_token=?,updated_at=? WHERE singleton=1 AND conversation_id=?").run(contextToken, now, conversationId)
+			return "REFRESHED"
+		})()
 	}
 	control(): { enabled: boolean; revision: number } { const row = this.db.query("SELECT enabled,revision FROM control_state WHERE singleton=1").get() as { enabled: number; revision: number }; return { enabled: row.enabled === 1, revision: row.revision } }
 	setControl(enabled: boolean): { enabled: boolean; revision: number } {
 		this.db.transaction(() => {
 			this.db.query("UPDATE control_state SET enabled=?,revision=revision+1 WHERE singleton=1 AND enabled<>?").run(enabled ? 1 : 0, enabled ? 1 : 0)
-			if (!enabled) { this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(new Date().toISOString()); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=?").run(new Date().toISOString()) }
+			if (!enabled) { const now = new Date().toISOString(); this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=?").run(now); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state='WAITING'").run(now); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='control-cancelled',updated_at=? WHERE state='INJECTING'").run(now) }
 		})()
 		return this.control()
 	}
 	checkpointForRequest(requestKey: string, root?: string): { checkpointId: string; state: string; rootSessionId: string; ownerInstance: string } | undefined { const row = this.db.query("SELECT checkpoint_id AS checkpointId,state,root_session_id AS rootSessionId,owner_instance AS ownerInstance FROM checkpoints WHERE request_key=?").get(requestKey) as { checkpointId: string; state: string; rootSessionId: string; ownerInstance: string } | null; return row && (!root || row.rootSessionId === root) ? row : undefined }
-	openCheckpoint(input: { checkpointId: string; requestKey: string; root: string; owner: string; conversationId: string; alias: number; question: string; choices: string[]; revision: number }): boolean {
+	openCheckpoint(input: { checkpointId: string; requestKey: string; root: string; owner: string; alias: number; question: string; choices: string[]; revision: number }): boolean {
 		const control = this.control(); if (!control.enabled || control.revision !== input.revision || this.bindingForRoot(input.root)?.ownerInstance !== input.owner) return false
+		const route = this.route(); if (!route.conversationId) return false
 		if (this.db.query("SELECT 1 FROM checkpoints WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").get(input.root)) return false
-		try { this.db.query("INSERT INTO checkpoints(checkpoint_id,request_key,root_session_id,owner_instance,conversation_id,alias,question,choices_json,state,inbound_id,control_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'SENDING',NULL,?,?,?)").run(input.checkpointId, input.requestKey, input.root, input.owner, input.conversationId, input.alias, input.question, JSON.stringify(input.choices), input.revision, new Date().toISOString(), new Date().toISOString()); return true } catch { return false }
+		try { this.db.query("INSERT INTO checkpoints(checkpoint_id,request_key,root_session_id,owner_instance,conversation_id,alias,question,choices_json,state,inbound_id,control_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'SENDING',NULL,?,?,?)").run(input.checkpointId, input.requestKey, input.root, input.owner, route.conversationId, input.alias, input.question, JSON.stringify(input.choices), input.revision, new Date().toISOString(), new Date().toISOString()); return true } catch { return false }
 	}
 	activateCheckpoint(checkpointId: string): boolean { return this.db.query("UPDATE checkpoints SET state='OPEN',updated_at=? WHERE checkpoint_id=? AND state='SENDING'").run(new Date().toISOString(), checkpointId).changes === 1 }
 	failCheckpoint(checkpointId: string): void { this.db.query("UPDATE checkpoints SET state='UNKNOWN',updated_at=? WHERE checkpoint_id=? AND state IN ('SENDING','OPEN','ANSWERING')").run(new Date().toISOString(), checkpointId) }
-	openCheckpointFor(binding: Binding): { checkpointId: string } | undefined { return this.db.query("SELECT checkpoint_id AS checkpointId FROM checkpoints WHERE root_session_id=? AND owner_instance=? AND conversation_id=? AND alias=? AND state='OPEN'").get(binding.rootSessionId, binding.ownerInstance, binding.conversationId, binding.alias) as { checkpointId: string } | undefined }
-	claimCheckpoint(checkpointId: string, inboundId: string, binding: Binding): boolean { return this.db.query("UPDATE checkpoints SET state='ANSWERING',inbound_id=?,updated_at=? WHERE checkpoint_id=? AND state='OPEN' AND root_session_id=? AND owner_instance=? AND conversation_id=? AND alias=?").run(inboundId, new Date().toISOString(), checkpointId, binding.rootSessionId, binding.ownerInstance, binding.conversationId, binding.alias).changes === 1 }
+	openCheckpointFor(binding: Binding): { checkpointId: string } | undefined { return this.db.query("SELECT checkpoint_id AS checkpointId FROM checkpoints WHERE root_session_id=? AND owner_instance=? AND alias=? AND state='OPEN'").get(binding.rootSessionId, binding.ownerInstance, binding.alias) as { checkpointId: string } | undefined }
+	claimCheckpoint(checkpointId: string, inboundId: string, binding: Binding): boolean { return this.db.query("UPDATE checkpoints SET state='ANSWERING',inbound_id=?,updated_at=? WHERE checkpoint_id=? AND state='OPEN' AND root_session_id=? AND owner_instance=? AND alias=?").run(inboundId, new Date().toISOString(), checkpointId, binding.rootSessionId, binding.ownerInstance, binding.alias).changes === 1 }
 	checkpointAnswered(checkpointId: string): void { this.db.query("UPDATE checkpoints SET state='ANSWERED',updated_at=? WHERE checkpoint_id=? AND state='ANSWERING'").run(new Date().toISOString(), checkpointId) }
 	checkpointInjectionUnknown(checkpointId: string): void { this.db.query("UPDATE checkpoints SET state='UNKNOWN',updated_at=? WHERE checkpoint_id=? AND state='ANSWERING'").run(new Date().toISOString(), checkpointId) }
 	checkpointState(checkpointId: string): string | undefined { return (this.db.query("SELECT state FROM checkpoints WHERE checkpoint_id=?").get(checkpointId) as { state: string } | null)?.state }
@@ -286,8 +362,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 		const control = this.control(), run = (existing?.runId ?? 0) + 1
 		this.db.query("INSERT INTO session_activity(root_session_id,owner_instance,running,idle,last_assistant_id,last_assistant_error,direct_assistant_id,epoch,run_id,origin,candidate_run,claimed_run,updated_at) VALUES(?,?,1,0,NULL,0,NULL,?,?,'LOCAL',NULL,0,?) ON CONFLICT(root_session_id) DO UPDATE SET owner_instance=excluded.owner_instance,running=1,idle=0,last_assistant_id=NULL,last_assistant_error=0,direct_assistant_id=NULL,epoch=excluded.epoch,run_id=excluded.run_id,origin='LOCAL',candidate_run=NULL,updated_at=excluded.updated_at").run(root, owner, control.revision, run, new Date().toISOString())
 	}
-	claimCompletion(root: string, owner: string): { outboundId: string; binding: Binding; payload: string } | undefined {
-		const binding = this.bindingForRoot(root), control = this.control(); if (!control.enabled || !binding?.contextToken || binding.ownerInstance !== owner) return
+	claimCompletion(root: string, owner: string): { outboundId: string; binding: RoutedBinding; payload: string } | undefined {
+		const registration = this.bindingForRoot(root), route = this.route(), control = this.control(); if (!control.enabled || !registration || !route.conversationId || !route.contextToken || registration.ownerInstance !== owner) return
+		const binding: RoutedBinding = { ...registration, conversationId: route.conversationId, contextToken: route.contextToken }
 		const row = this.db.query("SELECT running,epoch,run_id AS runId,origin,candidate_run AS candidateRun,claimed_run AS claimedRun,idle,last_assistant_id AS assistantId,last_assistant_error AS failed,direct_assistant_id AS directId FROM session_activity WHERE root_session_id=? AND owner_instance=?").get(root, owner) as any
 		if (row?.running && row.idle && row.origin !== "LOCAL") {
 			const consumed = this.db.query("UPDATE session_activity SET running=0,claimed_run=CASE WHEN claimed_run<run_id THEN run_id ELSE claimed_run END,updated_at=? WHERE root_session_id=? AND owner_instance=? AND run_id=? AND running=1 AND idle=1 AND origin=?").run(new Date().toISOString(), root, owner, row.runId, row.origin)
@@ -302,8 +379,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 		this.db.transaction(() => { try { this.db.query("INSERT INTO control_outbound VALUES(?,?,?,'completion','SENDING',?,?,?,?)").run(outboundId, dedupeKey, root, payload, binding.conversationId, binding.contextToken, new Date().toISOString()); this.db.query("UPDATE session_activity SET claimed_run=run_id,running=0,updated_at=? WHERE root_session_id=? AND run_id=? AND claimed_run<?").run(new Date().toISOString(), root, row.runId, row.runId); claimed = true } catch {} })()
 		return claimed ? { outboundId, binding, payload } : undefined
 	}
-	claimControlOutbound(input: { dedupeKey: string; root: string; kind: string; payload: string; revision?: number }): { outboundId: string; binding: Binding } | undefined {
-		const binding = this.bindingForRoot(input.root), control = this.control(); if (!control.enabled || (input.revision !== undefined && input.revision !== control.revision) || !binding?.contextToken) return
+	claimControlOutbound(input: { dedupeKey: string; root: string; kind: string; payload: string; revision?: number }): { outboundId: string; binding: RoutedBinding } | undefined {
+		const registration = this.bindingForRoot(input.root), route = this.route(), control = this.control(); if (!registration || !route.conversationId || !route.contextToken || !control.enabled || (input.revision !== undefined && input.revision !== control.revision)) return
+		const binding: RoutedBinding = { ...registration, conversationId: route.conversationId, contextToken: route.contextToken }
 		const outboundId = crypto.randomUUID()
 		try { this.db.query("INSERT INTO control_outbound VALUES(?,?,?,?,'SENDING',?,?,?,?)").run(outboundId, input.dedupeKey, input.root, input.kind, input.payload, binding.conversationId, binding.contextToken, new Date().toISOString()); return { outboundId, binding } } catch { return }
 	}
@@ -321,9 +399,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 		})()
 	}
 	markUnknown(messageId: string, reason: string): void { this.db.transaction(() => { this.db.query("UPDATE inbound SET state='UNKNOWN',reason=?,updated_at=? WHERE message_id=?").run(reason.slice(0, 200), new Date().toISOString(), messageId); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE inbound_id=? AND state='WAITING'").run(new Date().toISOString(), messageId) })() }
-	completePendingAndClaim(instanceId: string, root: string, inboundId: string, promptMessageId: string, assistantId: string, text: string, revision: number): { binding: Binding; payload: string; revision: number } | undefined {
-		const binding = this.bindingForRoot(root)
-		const control = this.control(); if (!binding || binding.ownerInstance !== instanceId || !binding.contextToken || !control.enabled || control.revision !== revision) return
+	completePendingAndClaim(instanceId: string, root: string, inboundId: string, promptMessageId: string, assistantId: string, text: string, revision: number): { binding: RoutedBinding; payload: string; revision: number } | undefined {
+		const registration = this.bindingForRoot(root), route = this.route()
+		const control = this.control(); if (!registration || registration.ownerInstance !== instanceId || !route.conversationId || !route.contextToken || !control.enabled || control.revision !== revision) return
+		const binding: RoutedBinding = { ...registration, conversationId: route.conversationId, contextToken: route.contextToken }
 		const payload = formatOutbound(binding.alias, text)
 		let claimed = false
 		this.db.transaction(() => {

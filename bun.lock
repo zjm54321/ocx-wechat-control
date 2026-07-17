@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@zjm54321/ocx-wechat-control",
+      "name": "@mingzzz/ocx-wechat-control",
       "dependencies": {
         "weixin-mcp": "1.7.7",
       },

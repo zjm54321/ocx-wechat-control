@@ -1,5 +1,5 @@
 {
-  "name": "@zjm54321/ocx-wechat-control",
+  "name": "@mingzzz/ocx-wechat-control",
   "version": "0.1.0",
   "description": "Restricted WeChat takeover plugin for OpenCode",
   "type": "module",

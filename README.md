@@ -7,7 +7,7 @@
 运行时要求 Bun 1.3.14 或更高版本。在 OpenCode 的用户配置目录安装公开包：
 
 ```sh
-npm install @mingzzz/ocx-wechat-control@0.1.1
+npm install @mingzzz/ocx-wechat-control@0.1.2
 ```
 
 然后在 OpenCode 配置中启用插件，并关闭任何并行的 WeChat MCP 配置：
@@ -15,7 +15,7 @@ npm install @mingzzz/ocx-wechat-control@0.1.1
 ```json
 {
   "plugin": [
-    ["@mingzzz/ocx-wechat-control@0.1.1", { "enabled": true }]
+    ["@mingzzz/ocx-wechat-control@0.1.2", { "enabled": true }]
   ],
   "mcp": {
     "weixin": { "enabled": false }
@@ -77,4 +77,4 @@ npm pack --dry-run
 
 ## 维护者发布
 
-npm package settings 中的 Trusted Publisher 必须精确绑定 GitHub owner `zjm54321`、repository `ocx-wechat-control`、workflow filename `publish.yml`，Environment 留空。发布 `0.1.1` 时先把发布提交 push 到 `main`，再创建并 push `v0.1.1` tag；workflow 会校验 tag/version、tag commit 属于 `origin/main`，且 registry 中尚无同版本后才通过 OIDC 发布。
+npm package settings 中的 Trusted Publisher 必须精确绑定 GitHub owner `zjm54321`、repository `ocx-wechat-control`、workflow filename `publish.yml`，Environment 留空。发布 `0.1.2` 时先把发布提交 push 到 `main`，再创建并 push `v0.1.2` tag；workflow 会校验 tag/version、tag commit 属于 `origin/main`，且 registry 中尚无同版本后才通过 OIDC 发布。

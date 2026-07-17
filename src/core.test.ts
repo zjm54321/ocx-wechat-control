@@ -197,7 +197,7 @@ test("worker releases its lock when Store construction fails", async () => {
 test("legacy lock policy and client lifecycle remain controlled", async () => {
 	expect(decideExistingBroker(true, false)).toBe("refuse"); expect(decideExistingBroker(false, false)).toBe("takeover"); expect(decideExistingBroker("unknown", false)).toBe("refuse")
 	expect(pidStatus(10, () => {})).toBe("alive"); expect(pidStatus(10, () => { throw Object.assign(new Error(), { code: "ESRCH" }) })).toBe("dead")
-	const directory = `${tempRoot}\\wechat-lock-${crypto.randomUUID()}`; mkdirSync(`${directory}\\broker.lock`, { recursive: true }); writeFileSync(`${directory}\\broker.lock\\owner.json`, JSON.stringify({ pid: 99, instanceToken: "legacy", endpoint: "http://127.0.0.1:9" })); expect((await readLock(directory))?.format).toBe("v1"); cleanup(directory)
+	const directory = path.join(tempRoot, `wechat-lock-${crypto.randomUUID()}`), lockDirectory = path.join(directory, "broker.lock"); mkdirSync(lockDirectory, { recursive: true }); writeFileSync(path.join(lockDirectory, "owner.json"), JSON.stringify({ pid: 99, instanceToken: "legacy", endpoint: "http://127.0.0.1:9" })); expect((await readLock(directory))?.format).toBe("v1"); cleanup(directory)
 	const registry = new ClientLifecycleRegistry(); let stopped = 0; await registry.replace("d", { stop: async () => { stopped++ } }); await registry.replace("d", { stop: async () => { stopped++ } }); expect(stopped).toBe(1); await registry.stopAll(); expect(stopped).toBe(2)
 })
 

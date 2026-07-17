@@ -1,0 +1,405 @@
+import { expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
+import { mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import * as path from "node:path"
+import { AdapterSendError, assertWeixinSendSuccess, JsonRpcPendingMap, MockWeChatAdapter, WeixinMcpAdapter, type McpClient } from "./adapter"
+import { BrokerService, clampCallbackTimeout } from "./broker"
+import { ClientLifecycleRegistry, createCallbackHandler, extractPromptAssistant, resolveRootSession } from "./client"
+import { CONTROL_OFF_TEXT, HELP_TEXT, PERMISSION_DENIED_TEXT, Store, formatOutbound, parseInboundText, parsePollToolResult } from "./core"
+import { runWorker } from "./worker"
+import { decideExistingBroker, pidStatus, readLock } from "./worker-runtime"
+import { ControlCommandHandled, captureRequestInputCallID, createControlCommandHook, createControlEventHook, createPermissionHook, executeRequestInputTool, registerControlCommands, requestInputToolOutcome, resolveWeixinCommand } from "./index"
+
+const tempRoot = path.join(tmpdir(), "ocx-wechat-control-tests")
+mkdirSync(tempRoot, { recursive: true })
+function tempFile(name: string): string { return path.join(tempRoot, `${name}-${crypto.randomUUID()}.sqlite`) }
+function cleanup(...paths: Array<string | undefined>): void { for (const value of paths) if (value) { try { rmSync(value, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }) } catch {}; try { rmSync(`${value}-wal`, { force: true }) } catch {}; try { rmSync(`${value}-shm`, { force: true }) } catch {} } }
+
+test("strict parser, safe alias and AI reply prefix", () => {
+	expect(parseInboundText("#12 \r\nhello")).toEqual({ ok: true, kind: "route", alias: 12, body: "hello" })
+	expect(parseInboundText(" #1\nhello")).toEqual({ ok: false, reason: "invalid-route" })
+	expect(parseInboundText(`#${"9".repeat(40)}\nhello`)).toEqual({ ok: false, reason: "invalid-route" })
+	expect(parseInboundText(" help ")).toEqual({ ok: true, kind: "help" })
+	expect(parseInboundText("x".repeat(4001))).toEqual({ ok: false, reason: "invalid-text" })
+	expect(HELP_TEXT).toContain("#编号"); expect(formatOutbound(2, "reply")).toBe("#2\nreply")
+})
+
+test("poll key includes cursor and message index", () => {
+	const msg = { message_type: 1, from_user_id: "user", context_token: "ctx", item_list: [{ type: 1, text_item: { text: "same" } }] }
+	const result = { content: [{ type: "text", text: JSON.stringify({ get_updates_buf: "cursor", msgs: [msg, msg] }) }] }
+	const parsed = parsePollToolResult(result); expect(parsed).toHaveLength(2); expect(parsed[0].id).not.toBe(parsed[1].id); expect(parsePollToolResult(result)[0].id).toBe(parsed[0].id)
+})
+
+class FakeMcp implements McpClient {
+	readonly calls: string[] = []
+	closed = false
+	constructor(private readonly pollFailure = false) {}
+	async request(method: string, params?: any): Promise<any> {
+		this.calls.push(`${method}:${params?.name ?? ""}`)
+		if (method === "initialize") return {}
+		if (method === "tools/list") return { tools: [{ name: "weixin_poll" }, { name: "weixin_send" }] }
+		if (params?.name === "weixin_poll") { if (this.pollFailure) throw new Error("exited"); return new Promise(() => {}) }
+		if (params?.name === "weixin_send") return { content: [{ type: "text", text: JSON.stringify({ ret: 0 }) }] }
+		throw new Error("unexpected call")
+	}
+	async notify(method: string): Promise<void> { this.calls.push(method) }
+	close(): void { this.closed = true }
+}
+
+test("MCP handshake, degraded exit, fail-closed send and fast JSON-RPC response", async () => {
+	const fake = new FakeMcp(), adapter = new WeixinMcpAdapter({ enabled: true, command: ["node", "fixed.js"], clientFactory: () => fake, retry: false })
+	await adapter.start(async () => {}); expect(adapter.status()).toBe("Ready"); await adapter.send("u", "#1\nok", "ctx")
+	expect(fake.calls.slice(0, 4)).toEqual(["initialize:", "notifications/initialized", "tools/list:", "tools/call:weixin_poll"])
+	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: "{}" }] })).not.toThrow()
+	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: JSON.stringify({ ret: 0 }) }] })).not.toThrow()
+	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: JSON.stringify({ errcode: 0 }) }] })).not.toThrow(); adapter.stop()
+	const exited = new WeixinMcpAdapter({ enabled: true, command: ["node", "fixed.js"], clientFactory: () => new FakeMcp(true), retry: false }); await exited.start(async () => {}); await Bun.sleep(5); expect(exited.status()).toBe("Degraded")
+	const map = new JsonRpcPendingMap(); expect(await map.request((message: any) => map.accept({ jsonrpc: "2.0", id: message.id, result: "fast" }), "fast", {})).toBe("fast")
+})
+
+test("weixin_send parser rejects MCP, business, malformed, ambiguous and unknown failures", () => {
+	const failures: Array<[unknown, string]> = [
+		[null, "malformed-result"],
+		[{ isError: true, content: [{ type: "text", text: "{}" }] }, "mcp-error"],
+		[{ content: [{ type: "text", text: "not-json" }] }, "malformed-result"],
+		[{ content: [{ type: "text", text: "[]" }] }, "malformed-result"],
+		[{ content: [{ type: "text", text: JSON.stringify({ ret: 1 }) }] }, "explicit-business-failure"],
+		[{ content: [{ type: "text", text: JSON.stringify({ errcode: 400 }) }] }, "explicit-business-failure"],
+		[{ content: [{ type: "text", text: JSON.stringify({ ret: 0, errcode: 1 }) }] }, "explicit-business-failure"],
+		[{ content: [{ type: "text", text: JSON.stringify({ ret: 0, errmsg: "failed" }) }] }, "ambiguous-result"],
+		[{ content: [{ type: "text", text: JSON.stringify({ ret: 0, errmsg: "" }) }] }, "ambiguous-result"],
+		[{ content: [{ type: "text", text: JSON.stringify({ ok: true }) }] }, "unknown-result"],
+		[{ content: [{ type: "text", text: JSON.stringify({ message: "sent" }) }] }, "unknown-result"],
+		[{ content: [{ type: "text", text: JSON.stringify({ ret: "0" }) }] }, "explicit-business-failure"],
+	]
+	for (const [value, classification] of failures) {
+		try { assertWeixinSendSuccess(value); throw new Error("expected parser failure") }
+		catch (error) { expect(error).toBeInstanceOf(AdapterSendError); expect((error as AdapterSendError).classification).toBe(classification) }
+	}
+})
+
+function fakeClient(prompt: () => Promise<any>) {
+	let prompts = 0
+	let promptOptions: any
+	return { get prompts() { return prompts }, get promptOptions() { return promptOptions }, session: { get: async () => ({ data: { id: "root" } }), prompt: async (options: any) => { prompts++; promptOptions = options; return prompt() } } }
+}
+function injectRequest(method = "POST", envelope: any = { kind: "inbound" }): Request { return new Request("http://127.0.0.1/inject", { method, headers: { "x-wechat-control-key": "secret", "x-wechat-instance-token": "token", "content-type": "application/json" }, body: method === "POST" ? JSON.stringify({ rootSessionId: "root", directory: "d", text: "hello", inboundId: "in", envelope }) : undefined }) }
+
+test("callback waits for one synchronous prompt and returns only its direct assistant", async () => {
+	const client = fakeClient(async () => { await Bun.sleep(10); return { data: { info: { id: "assistant", parentID: "msg_user_generated", role: "assistant" }, parts: [{ type: "reasoning", text: "hidden" }, { type: "text", text: "final" }] } } })
+	const response = await createCallbackHandler(client, "secret", "token")(injectRequest()); expect(response.status).toBe(200)
+	const body = await response.json() as any; expect(body.promptMessageId).toBe("msg_user_generated"); expect(body.assistantMessageId).toBe("assistant"); expect(body.text).toBe("final"); expect(client.prompts).toBe(1)
+	expect(Object.hasOwn(client.promptOptions.body, "messageID")).toBe(false)
+	expect(extractPromptAssistant({ data: { info: { id: "a", parentID: "msg_parent", role: "assistant" }, parts: [{ type: "text", text: "x" }] } })).toEqual({ promptMessageId: "msg_parent", assistantMessageId: "a", text: "x" })
+})
+
+test("callback no-text, thrown prompt, invalid shape and GET all fail without reinjection", async () => {
+	for (const result of [
+		async () => ({ data: { info: { id: "a", parentID: "msg_parent", role: "assistant" }, parts: [{ type: "tool" }] } }),
+		async () => { throw new Error("prompt failed") },
+		async () => ({ data: { info: { id: "u", parentID: "msg_parent", role: "user" }, parts: [{ type: "text", text: "bad" }] } }),
+		async () => ({ data: { info: { id: "a", role: "assistant" }, parts: [{ type: "text", text: "missing parent" }] } }),
+		async () => ({ data: { info: { id: "a", parentID: "not-a-message-id", role: "assistant" }, parts: [{ type: "text", text: "bad parent" }] } }),
+	]) {
+		const client = fakeClient(result); const response = await createCallbackHandler(client, "secret", "token")(injectRequest()); expect(response.status).toBe(409); expect(client.prompts).toBe(1)
+	}
+	const getClient = fakeClient(async () => { throw new Error("must not run") }); expect((await createCallbackHandler(getClient, "secret", "token")(injectRequest("GET"))).status).toBe(405); expect(getClient.prompts).toBe(0)
+})
+
+function readyBroker(fetcher: typeof fetch) {
+	const store = new Store(":memory:"), adapter = new MockWeChatAdapter()
+	store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", conversationId: "user" }); store.setControl(true)
+	return { store, adapter, broker: new BrokerService(store, adapter, "secret", "worker", fetcher) }
+}
+
+test("one inbound calls callback once, sends direct final once, and deduplicates", async () => {
+	let callbacks = 0
+	const { store, adapter, broker } = readyBroker(async () => { callbacks++; return Response.json({ promptMessageId: "prompt", assistantMessageId: "assistant", text: "final" }) })
+	const message = { id: "in", fromUserId: "user", contextToken: "ctx", text: "#1\nhello", cursorHint: "c" }
+	expect((await broker.handleInbound(message)).ok).toBe(true); expect((await broker.handleInbound(message)).reason).toBe("duplicate-at-least-once-key")
+	expect(callbacks).toBe(1); expect(adapter.sent).toEqual([{ to: "user", text: "#1\nfinal", contextToken: "ctx" }]); expect(store.pendingState("in")).toBe("SENT"); store.close()
+})
+
+test("callback timeout and invalid direct result become UNKNOWN without replay", async () => {
+	for (const fetcher of [
+		async () => { throw new DOMException("timed out", "TimeoutError") },
+		async () => Response.json({ promptMessageId: "p", assistantMessageId: "a" }),
+	]) {
+		const { store, adapter, broker } = readyBroker(fetcher as typeof fetch); const result = await broker.handleInbound({ id: crypto.randomUUID(), fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" })
+		expect(result.reason).toBe("callback-failed-or-timeout"); expect(adapter.sent).toHaveLength(0); expect(store.state((store.db.query("SELECT message_id AS id FROM inbound").get() as any).id)).toBe("UNKNOWN"); store.close()
+	}
+	expect(clampCallbackTimeout(1)).toBe(30_000); expect(clampCallbackTimeout(99_999_999)).toBe(600_000)
+})
+
+test("duplicate completion cannot send twice and orphan WAITING sweeps to UNKNOWN", () => {
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", conversationId: "user" }); store.updateContext(1, "ctx"); const revision = store.setControl(true).revision
+	store.beginInbound({ id: "complete", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" }); store.beginPending("complete", "root", 1, revision)
+	expect(store.completePendingAndClaim("owner", "root", "complete", "p", "a", "final", revision)).toBeDefined(); expect(store.completePendingAndClaim("owner", "root", "complete", "p", "a", "final", revision)).toBeUndefined()
+	store.beginInbound({ id: "orphan", fromUserId: "user", contextToken: "ctx", text: "#1\ny", cursorHint: "d" }); store.beginPending("orphan", "root", 1, revision); store.db.query("UPDATE pending_replies SET updated_at='2000-01-01T00:00:00.000Z' WHERE inbound_id='orphan'").run()
+	expect(store.sweepOrphanWaiting(Date.now(), 1000)).toBe(1); expect(store.pendingState("orphan")).toBe("UNKNOWN"); expect(store.state("orphan")).toBe("UNKNOWN"); store.close()
+})
+
+test("broker requires POST and Ready adapter for bind and inbound", async () => {
+	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(), broker = new BrokerService(store, adapter, "secret", "worker", async () => Response.json({ ok: true }))
+	const get = new Request("http://127.0.0.1", { method: "GET", headers: { "x-wechat-control-key": "secret" } }); expect((await broker.handleRequest(get)).status).toBe(405); expect(store.instance("new")).toBeUndefined()
+	store.register("owner", "token", "http://127.0.0.1:1"); adapter.statusValue = "Degraded"
+	const request = () => new Request("http://127.0.0.1", { method: "POST", headers: { "x-wechat-control-key": "secret" }, body: JSON.stringify({ method: "bind-current", instanceId: "owner", instanceToken: "token", rootSessionId: "root", directory: "d", conversationId: "user" }) })
+	expect((await broker.handleRequest(request())).status).toBe(503); expect((await broker.handleInbound({ id: "x", fromUserId: "user", contextToken: "c", text: "#1\nx", cursorHint: "c" })).reason).toBe("adapter-not-ready")
+	const health = await broker.handleRequest(new Request("http://127.0.0.1", { method: "POST", headers: { "x-wechat-control-key": "secret" }, body: JSON.stringify({ method: "health", challenge: "worker" }) })); expect((await health.json() as any).adapter).toBe("Degraded")
+	adapter.statusValue = "Ready"; expect((await broker.handleRequest(request())).status).toBe(200); store.close()
+})
+
+function createWalV2(filename: string): Database {
+	const db = new Database(filename); db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA user_version=2; CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE bindings(alias INTEGER PRIMARY KEY,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,conversation_id TEXT NOT NULL UNIQUE,context_token TEXT,created_at TEXT NOT NULL); CREATE TABLE inbound(message_id TEXT PRIMARY KEY,from_user_id TEXT NOT NULL,context_token TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,root_session_id TEXT,prompt_message_id TEXT,reason TEXT,updated_at TEXT NOT NULL); CREATE TABLE outbound(message_id TEXT PRIMARY KEY,inbound_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,payload TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE pending_replies(inbound_id TEXT PRIMARY KEY,root_session_id TEXT NOT NULL,prompt_message_id TEXT,alias INTEGER NOT NULL,state TEXT NOT NULL,assistant_message_id TEXT,payload TEXT,injected_at INTEGER,updated_at TEXT NOT NULL); CREATE TABLE audit(id INTEGER PRIMARY KEY,at TEXT NOT NULL,reason TEXT NOT NULL);")
+	db.exec("INSERT INTO meta VALUES('custom','wal-data'); INSERT INTO bindings VALUES(7,'root-wal','d','owner','conversation-wal','ctx','now'); INSERT INTO inbound VALUES('in-wal','user','ctx','x','RECEIVED',NULL,NULL,NULL,'now'); INSERT INTO outbound VALUES('out-wal','legacy-in','PENDING','#7\\nold','now'); INSERT INTO pending_replies VALUES('pending-wal','root-wal','prompt-wal',7,'WAITING',NULL,NULL,NULL,'now');")
+	return db
+}
+
+test("WAL-consistent v2-to-v4 snapshot preserves data and migration is idempotent", () => {
+	const filename = tempFile("wal-v2"), writer = createWalV2(filename), store = new Store(filename); const backup = store.migrationBackupPath
+	expect(backup).toBeDefined(); expect(backup).toContain("pre-v4"); expect(store.bindingForAlias(7)?.rootSessionId).toBe("root-wal"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(4); expect(store.control()).toEqual({ enabled: false, revision: 0 })
+	expect((store.db.query("PRAGMA table_info(session_activity)").all() as any[]).map((row) => row.name)).toContain("epoch"); expect((store.db.query("PRAGMA table_info(checkpoints)").all() as any[]).map((row) => row.name)).toContain("request_key"); expect((store.db.query("PRAGMA table_info(outbound_echoes)").all() as any[]).map((row) => row.name)).toContain("expires_ms")
+	const snapshot = new Database(backup!); expect((snapshot.query("SELECT value FROM meta WHERE key='custom'").get() as any).value).toBe("wal-data"); expect((snapshot.query("SELECT conversation_id AS value FROM bindings WHERE alias=7").get() as any).value).toBe("conversation-wal"); expect(snapshot.query("SELECT 1 FROM pending_replies WHERE inbound_id='pending-wal'").get()).toBeDefined(); snapshot.close()
+	store.bind({ rootSessionId: "root-two", directory: "d", ownerInstance: "owner", conversationId: "conversation-wal" }); store.updateContext(7, "new-context"); expect(store.bindingForRoot("root-two")?.contextToken).toBe("new-context")
+	store.close(); writer.close(); const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect(reopened.bindingForAlias(7)?.conversationId).toBe("conversation-wal"); reopened.close(); cleanup(filename, backup)
+})
+
+function createWalV3(filename: string): Database {
+	const db = new Database(filename); db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA user_version=3; CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE bindings(alias INTEGER PRIMARY KEY,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,conversation_id TEXT NOT NULL,context_token TEXT,created_at TEXT NOT NULL); CREATE TABLE inbound(message_id TEXT PRIMARY KEY,from_user_id TEXT NOT NULL,context_token TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,root_session_id TEXT,prompt_message_id TEXT,reason TEXT,updated_at TEXT NOT NULL); CREATE TABLE pending_replies(inbound_id TEXT PRIMARY KEY,root_session_id TEXT NOT NULL,prompt_message_id TEXT,alias INTEGER NOT NULL,state TEXT NOT NULL,assistant_message_id TEXT,payload TEXT,injected_at INTEGER,updated_at TEXT NOT NULL); CREATE TABLE outbound(message_id TEXT PRIMARY KEY,inbound_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,payload TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE control_state(singleton INTEGER PRIMARY KEY,enabled INTEGER NOT NULL,revision INTEGER NOT NULL); CREATE TABLE checkpoints(checkpoint_id TEXT PRIMARY KEY,root_session_id TEXT NOT NULL,owner_instance TEXT NOT NULL,conversation_id TEXT NOT NULL,alias INTEGER NOT NULL,question TEXT NOT NULL,choices_json TEXT NOT NULL,state TEXT NOT NULL,inbound_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE session_activity(root_session_id TEXT PRIMARY KEY,owner_instance TEXT NOT NULL,running INTEGER NOT NULL,idle INTEGER NOT NULL,last_assistant_id TEXT,last_assistant_error INTEGER NOT NULL,direct_assistant_id TEXT,updated_at TEXT NOT NULL); CREATE TABLE control_outbound(outbound_id TEXT PRIMARY KEY,dedupe_key TEXT NOT NULL UNIQUE,root_session_id TEXT NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE outbound_echoes(echo_hash TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE audit(id INTEGER PRIMARY KEY,at TEXT NOT NULL,reason TEXT NOT NULL);")
+	db.exec("INSERT INTO meta VALUES('schema_version','3'); INSERT INTO bindings VALUES(4,'root-v3','d','old-owner','conversation-v3','ctx-v3','now'); INSERT INTO control_state VALUES(1,1,17); INSERT INTO inbound VALUES('in-v3','conversation-v3','ctx-v3','x','INJECTED','root-v3','prompt-v3',NULL,'now'); INSERT INTO pending_replies VALUES('in-v3','root-v3','prompt-v3',4,'UNKNOWN','assistant-v3','#4\\nx',1,'now'); INSERT INTO outbound VALUES('assistant-v3','in-v3','UNKNOWN','#4\\nx','now'); INSERT INTO checkpoints VALUES('cp-v3','root-v3','old-owner','conversation-v3',4,'q','[]','UNKNOWN','in-v3','now','now');")
+	return db
+}
+
+test("old deployed v3 receives a pre-v4 snapshot and preserves control/pending/checkpoint data", () => {
+	const filename = tempFile("wal-v3"), writer = createWalV3(filename), store = new Store(filename), backup = store.migrationBackupPath
+	expect(backup).toContain("pre-v4"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(4); expect(store.bindingForAlias(4)?.conversationId).toBe("conversation-v3"); expect(store.control()).toEqual({ enabled: true, revision: 17 }); expect(store.pendingState("in-v3")).toBe("UNKNOWN"); expect(store.checkpointState("cp-v3")).toBe("UNKNOWN"); expect(store.checkpointForRequest("cp-v3", "root-v3")?.checkpointId).toBe("cp-v3")
+	const snapshot = new Database(backup!); expect((snapshot.query("PRAGMA user_version").get() as any).user_version).toBe(3); expect((snapshot.query("SELECT revision FROM control_state").get() as any).revision).toBe(17); expect((snapshot.query("SELECT state FROM pending_replies WHERE inbound_id='in-v3'").get() as any).state).toBe("UNKNOWN"); expect((snapshot.query("SELECT state FROM checkpoints WHERE checkpoint_id='cp-v3'").get() as any).state).toBe("UNKNOWN"); snapshot.close()
+	store.close(); writer.close(); const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect(reopened.control().revision).toBe(17); reopened.close(); cleanup(filename, backup)
+})
+
+test("forced migration failure reports an openable WAL-consistent backup", () => {
+	const filename = tempFile("wal-fail"), writer = createWalV2(filename); let backup: string | undefined
+	expect(() => new Store(filename, { onSnapshot: (value) => { backup = value }, migrationFault: () => { throw new Error("forced") } })).toThrow(/consistent backup=/)
+	const snapshot = new Database(backup!); expect((snapshot.query("SELECT root_session_id AS root FROM bindings WHERE alias=7").get() as any).root).toBe("root-wal"); expect(snapshot.query("SELECT 1 FROM inbound WHERE message_id='in-wal'").get()).toBeDefined(); snapshot.close(); writer.close(); cleanup(filename, backup)
+})
+
+test("worker releases its lock when Store construction fails", async () => {
+	let released = 0
+	await expect(runWorker({ enabled: true, weixinCommand: ["node", "fixed.js"] }, {
+		initializeState: async () => ({ directory: tempRoot, secret: "secret" }),
+		acquireLock: async () => ({ update: async () => {}, release: async () => { released++ } }),
+		createStore: () => { throw new Error("migration failed") },
+	})).rejects.toThrow("migration failed")
+	expect(released).toBe(1)
+})
+
+test("legacy lock policy and client lifecycle remain controlled", async () => {
+	expect(decideExistingBroker(true, false)).toBe("refuse"); expect(decideExistingBroker(false, false)).toBe("takeover"); expect(decideExistingBroker("unknown", false)).toBe("refuse")
+	expect(pidStatus(10, () => {})).toBe("alive"); expect(pidStatus(10, () => { throw Object.assign(new Error(), { code: "ESRCH" }) })).toBe("dead")
+	const directory = `${tempRoot}\\wechat-lock-${crypto.randomUUID()}`; mkdirSync(`${directory}\\broker.lock`, { recursive: true }); writeFileSync(`${directory}\\broker.lock\\owner.json`, JSON.stringify({ pid: 99, instanceToken: "legacy", endpoint: "http://127.0.0.1:9" })); expect((await readLock(directory))?.format).toBe("v1"); cleanup(directory)
+	const registry = new ClientLifecycleRegistry(); let stopped = 0; await registry.replace("d", { stop: async () => { stopped++ } }); await registry.replace("d", { stop: async () => { stopped++ } }); expect(stopped).toBe(1); await registry.stopAll(); expect(stopped).toBe(2)
+})
+
+function authenticatedRequest(method: string, extra: object = {}): Request { return new Request("http://127.0.0.1", { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret" }, body: JSON.stringify({ method, instanceId: "owner", instanceToken: "token", ...extra }) }) }
+
+test("global control revision, back cancellation and v3 crash recovery are durable", () => {
+	const filename = tempFile("v3-recovery"), store = new Store(filename)
+	expect(store.control()).toEqual({ enabled: false, revision: 0 }); expect(store.setControl(true)).toEqual({ enabled: true, revision: 1 })
+	store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", conversationId: "user" }); store.updateContext(1, "ctx")
+	expect(store.openCheckpoint({ checkpointId: "cp", requestKey: "call", root: "root", owner: "owner", conversationId: "user", alias: 1, question: "q", choices: [], revision: 1 })).toBe(true)
+	const claim = store.claimControlOutbound({ dedupeKey: "d", root: "root", kind: "completion", payload: "#1\nx" }); expect(claim).toBeDefined()
+	expect(store.setControl(false)).toEqual({ enabled: false, revision: 2 }); expect(store.checkpointState("cp")).toBe("CANCELLED"); store.close()
+	const reopened = new Store(filename); expect((reopened.db.query("SELECT state FROM control_outbound WHERE dedupe_key='d'").get() as any).state).toBe("UNKNOWN"); reopened.close(); cleanup(filename)
+})
+
+test("checkpoint is asynchronous, answer targets exact binding, and failures never replay", async () => {
+	let envelope: any
+	const { store, adapter, broker } = readyBroker(async (_url, init) => { envelope = JSON.parse(String(init?.body)).envelope; return Response.json({ promptMessageId: "prompt", assistantMessageId: "direct", text: "accepted" }) })
+	store.updateContext(1, "ctx")
+	const response = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "call-checkpoint", question: "Choose", choices: ["A", "B"] })); expect(response.status).toBe(200)
+	const checkpointId = (await response.json() as any).checkpointId; expect(store.checkpointState(checkpointId)).toBe("OPEN"); expect(adapter.sent[0].to).toBe("user"); expect(adapter.sent[0].text).toContain("1. A")
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "tool-turn", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); expect(adapter.sent).toHaveLength(1)
+	const result = await broker.handleInbound({ id: "answer", fromUserId: "user", contextToken: "ctx2", text: "#1\nB", cursorHint: "c" })
+	expect(result.ok).toBe(true); expect(envelope).toEqual({ kind: "checkpoint", checkpointId }); expect(store.checkpointState(checkpointId)).toBe("ANSWERED"); expect(adapter.sent.at(-1)?.text).toBe("#1\naccepted")
+	await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(0); expect((store.db.query("SELECT running FROM session_activity").get() as any).running).toBe(0)
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "local-after-checkpoint", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1)
+	expect((await broker.handleInbound({ id: "answer", fromUserId: "user", contextToken: "ctx2", text: "#1\nB", cursorHint: "c" })).reason).toBe("duplicate-at-least-once-key"); store.close()
+})
+
+test("back refuses inbound/checkpoints/permission/completion while help remains available", async () => {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "x" })); store.updateContext(1, "ctx"); store.setControl(false)
+	const checkpoint = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "off-call", question: "q", choices: [] })); expect(checkpoint.status).toBe(409)
+	const denied = await broker.handleRequest(authenticatedRequest("permission-denied-notice", { rootSessionId: "root", permissionId: "perm" })); expect((await denied.json() as any).handled).toBe(false)
+	expect((await broker.handleInbound({ id: "off", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" })).reason).toBe("control-disabled"); expect(adapter.sent.at(-1)?.text).toBe(CONTROL_OFF_TEXT)
+	expect((await broker.handleInbound({ id: "help", fromUserId: "user", contextToken: "ctx", text: "help", cursorHint: "d" })).ok).toBe(true); expect(adapter.sent.at(-1)?.text).toBe(HELP_TEXT)
+	expect(store.db.query("SELECT kind,state FROM control_outbound WHERE kind IN ('control-off','help') ORDER BY kind").all()).toEqual([{ kind: "control-off", state: "SENT" }, { kind: "help", state: "SENT" }])
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "a", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); expect(adapter.sent).toHaveLength(2); store.close()
+})
+
+test("permission denial and terminal completion use fixed durable dedupe messages", async () => {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({})); store.updateContext(1, "ctx")
+	const permission = await broker.handleRequest(authenticatedRequest("permission-denied-notice", { rootSessionId: "root", permissionId: "perm" })); expect((await permission.json() as any).handled).toBe(true); await broker.drainBackground(); expect(adapter.sent[0].text).toBe(`#1\n${PERMISSION_DENIED_TEXT}`)
+	await broker.handleRequest(authenticatedRequest("permission-denied-notice", { rootSessionId: "root", permissionId: "perm" })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(1)
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "terminal", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" }))
+	await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); expect((store.db.query("SELECT state FROM control_outbound WHERE kind='completion'").get() as any).state).toBe("SENT"); store.close()
+})
+
+test("exact outbound echoes are suppressed before routing", async () => {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "direct", text: "reply" }))
+	await broker.handleInbound({ id: "one", fromUserId: "user", contextToken: "ctx", text: "#1\nhello", cursorHint: "a" }); const payload = adapter.sent[0].text
+	const echoed = await broker.handleInbound({ id: "echo", fromUserId: "user", contextToken: "ctx", text: payload, cursorHint: "b" }); expect(echoed.reason).toBe("outbound-echo"); expect(adapter.sent).toHaveLength(1); expect(store.state("echo")).toBe("UNKNOWN"); store.close()
+})
+
+test("commands are conflict-safe, clear sentinels, reject arguments and always throw handled", async () => {
+	const config: any = {}; registerControlCommands(config); expect(config.command.leave.template).toContain("LEAVE_HANDLED"); expect(() => registerControlCommands(config)).not.toThrow(); expect(() => registerControlCommands({ command: { back: {} } })).toThrow("command conflict")
+	const calls: any[] = [], toasts: boolean[] = []; const rpcCall: any = async (_e: string, _s: string, body: any) => { calls.push(body); return { ok: true } }
+	const hook = createControlCommandHook(rpcCall, async (enabled) => { toasts.push(enabled) }, "e", "s", "i", "t"), output = { parts: [{ type: "text", text: "sentinel" }] }
+	await expect(hook({ command: "leave", arguments: "" }, output)).rejects.toBeInstanceOf(ControlCommandHandled); expect(output.parts).toHaveLength(0); expect(calls[0].enabled).toBe(true); expect(toasts).toEqual([true])
+	await expect(hook({ command: "back", arguments: "bad" }, { parts: [1] })).rejects.toBeInstanceOf(ControlCommandHandled); expect(calls).toHaveLength(1)
+	const failed = createControlCommandHook(async () => { throw new Error("rpc") }, async () => {}, "e", "s", "i", "t"); await expect(failed({ command: "back", arguments: "" }, { parts: [1] })).rejects.toBeInstanceOf(ControlCommandHandled)
+})
+
+test("permission hook denies only authenticated routed handling and RPC failure stays ask", async () => {
+	const calls: any[] = [], deny = createPermissionHook(async () => "root", (async (_e: string, _s: string, body: any) => { calls.push(body); return body.method === "control-get" ? { enabled: true, routable: true } : { handled: true } }) as any, "e", "s", "i", "t"), denied: any = { status: "allow" }; await deny({ sessionID: "child", id: "p" }, denied); expect(denied.status).toBe("deny"); await Bun.sleep(0); expect(calls.map((item) => item.method)).toEqual(["control-get", "permission-denied-notice"])
+	const unavailable = createPermissionHook(async () => "root", (async () => { throw new Error("down") }) as any, "e", "s", "i", "t"), asked: any = { status: "allow" }; await unavailable({ sessionID: "child", id: "p" }, asked); expect(asked.status).toBe("ask")
+})
+
+test("resolveRootSession is bounded and rejects cycles", async () => {
+	const parents = new Map([["child", "parent"], ["parent", "root"], ["root", undefined]])
+	const client = { session: { get: async ({ path }: any) => ({ data: { id: path.id, parentID: parents.get(path.id) } }) } }; expect(await resolveRootSession(client, "child")).toBe("root")
+	const cyclic = { session: { get: async ({ path }: any) => ({ data: { id: path.id, parentID: path.id === "a" ? "b" : "a" } }) } }; await expect(resolveRootSession(cyclic, "a")).rejects.toThrow("cycle")
+	const deep = { session: { get: async ({ path }: any) => ({ data: { id: path.id, parentID: String(Number(path.id) + 1) } }) } }; await expect(resolveRootSession(deep, "0")).rejects.toThrow("depth")
+})
+
+async function runCompletionOrder(events: Array<["status", "busy" | "idle"] | ["assistant", string]>) {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({})); store.updateContext(1, "ctx")
+	for (const [kind, value] of events) await broker.handleRequest(authenticatedRequest(kind === "status" ? "observe-status" : "observe-assistant", kind === "status" ? { rootSessionId: "root", status: value } : { rootSessionId: "root", assistantMessageId: value, failed: false }))
+	await broker.drainBackground(); return { store, adapter, broker }
+}
+
+test("completion claims all supported orderings and duplicate busy never clears candidate", async () => {
+	for (const events of [
+		[["status", "busy"], ["assistant", "a"], ["status", "idle"]],
+		[["status", "busy"], ["status", "idle"], ["assistant", "a"]],
+		[["status", "busy"], ["assistant", "a"], ["status", "busy"], ["status", "idle"]],
+		[["status", "busy"], ["assistant", "a"], ["assistant", "a"], ["status", "idle"], ["status", "idle"]],
+	] as any[]) {
+		const { store, adapter } = await runCompletionOrder(events); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); expect((store.db.query("SELECT run_id AS runId FROM session_activity").get() as any).runId).toBe(1); store.close()
+	}
+})
+
+test("same assistant cannot complete twice across a late duplicate run", async () => {
+	const { store, adapter, broker } = await runCompletionOrder([["status", "busy"], ["assistant", "same"], ["status", "idle"]]); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "same", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(1); store.close()
+})
+
+test("assistant preserves idle, child events stay child and cannot complete a bound root", async () => {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({})); store.updateContext(1, "ctx")
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "late", failed: false })); expect((store.db.query("SELECT idle FROM session_activity").get() as any).idle).toBe(1); await broker.drainBackground(); expect(adapter.sent).toHaveLength(1)
+	const calls: any[] = [], hook = createControlEventHook((async (_e: string, _s: string, body: any) => { calls.push(body); if (body.status === "busy") await Bun.sleep(5); return {} }) as any, "e", "s", "owner", "token")
+	await Promise.all([hook({ event: { type: "session.status", properties: { sessionID: "child", status: { type: "busy" } } } }), hook({ event: { type: "message.updated", properties: { info: { role: "assistant", sessionID: "child", id: "child-a", time: { completed: 1 } } } } })]); expect(calls.map((item) => item.rootSessionId)).toEqual(["child", "child"]); expect(calls.map((item) => item.method)).toEqual(["observe-status", "observe-assistant"])
+	const childResponse = await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "child", status: "busy" })); expect((await childResponse.json() as any).observed).toBe(false); store.close()
+})
+
+class CountingAdapter extends MockWeChatAdapter { attempts = 0; slow?: Promise<void>; override async send(to: string, text: string, contextToken: string): Promise<void> { this.attempts++; if (this.slow) return this.slow; return super.send(to, text, contextToken) } }
+function brokerWithAdapter(adapter: MockWeChatAdapter, fetcher: typeof fetch = async () => Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "ok" })) { const store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", conversationId: "user" }); store.updateContext(1, "ctx"); store.setControl(true); return { store, broker: new BrokerService(store, adapter, "secret", "worker", fetcher) } }
+
+test("request-input validates content/readiness and UNKNOWN request keys never resend", async () => {
+	const adapter = new CountingAdapter(), { store, broker } = brokerWithAdapter(adapter); adapter.failSend = true
+	const request = (requestKey: string, question: string, choices: string[] = []) => broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey, question, choices }))
+	const unknown = await request("same-call", "Question"); expect((await unknown.json() as any).state).toBe("UNKNOWN"); expect(adapter.attempts).toBe(1)
+	adapter.failSend = false; const replay = await request("same-call", "Question"); expect(await replay.json()).toMatchObject({ replayed: true, state: "UNKNOWN" }); expect(adapter.attempts).toBe(1); expect((await request("other-call", "Other")).status).toBe(409)
+	store.setControl(false); store.setControl(true); expect((await request("blank", "   ")).status).toBe(409); expect((await request("control", "bad\u0001")).status).toBe(409); expect((await request("choice-newline", "q", ["a\nb"])).status).toBe(409)
+	adapter.statusValue = "Degraded"; expect((await request("degraded", "q")).status).toBe(503); expect(store.checkpointForRequest("degraded", "root", "owner")).toBeUndefined(); store.close()
+})
+
+test("request-input tool converts UNKNOWN and thrown RPC into fixed no-retry endings", async () => {
+	expect(await requestInputToolOutcome(async () => ({ state: "UNKNOWN" }))).toContain("禁止重复发送")
+	expect(await requestInputToolOutcome(async () => { throw new Error("timeout") })).toContain("禁止重复发送")
+	expect(await requestInputToolOutcome(async () => ({ state: "OPEN" }))).toContain("立即结束本回合")
+})
+
+test("actual tool before-to-execute bridge preserves the stable callID request key", async () => {
+	const args: any = { question: "q", choices: [] }, output = { args }; captureRequestInputCallID({ tool: "wechat_request_input", callID: "call-stable", sessionID: "root" }, output); let received = ""
+	const result = await executeRequestInputTool(args, { sessionID: "root", messageID: "message" }, async (requestKey) => { received = requestKey; return { state: "OPEN" } }); expect(received).toBe("call-stable"); expect(result).toContain("立即结束本回合")
+})
+
+test("request-key replay survives owner rebind, validates current owner, and never resends", async () => {
+	const adapter = new CountingAdapter(), { store, broker } = brokerWithAdapter(adapter); const first = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "rebind-call", question: "q", choices: [] })); expect(first.status).toBe(200); expect(adapter.attempts).toBe(1)
+	store.register("owner2", "token2", "http://127.0.0.1:2"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner2", conversationId: "user" })
+	const owner2 = new Request("http://127.0.0.1", { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret" }, body: JSON.stringify({ method: "request-input", instanceId: "owner2", instanceToken: "token2", rootSessionId: "root", requestKey: "rebind-call", question: "q", choices: [] }) }), replay = await broker.handleRequest(owner2); expect(await replay.json()).toMatchObject({ replayed: true, ownerChanged: true, state: "CANCELLED" }); expect(adapter.attempts).toBe(1)
+	expect((await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "rebind-call", question: "q", choices: [] }))).status).toBe(409); store.close()
+})
+
+test("background rejection is audited and fully consumed", async () => {
+	const { store, broker } = readyBroker(async () => Response.json({})); (broker as any).defer(Promise.reject(new Error("background"))); await broker.drainBackground(); expect((store.db.query("SELECT reason FROM audit WHERE reason='background-action-failed'").get() as any).reason).toBe("background-action-failed"); store.close()
+})
+
+test("concurrent single-worker control-set calls produce one transition per target state", async () => {
+	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(), broker = new BrokerService(store, adapter, "secret", "worker", async () => Response.json({})); store.register("owner", "token", "http://127.0.0.1:1")
+	await Promise.all(Array.from({ length: 20 }, () => broker.handleRequest(authenticatedRequest("control-set", { enabled: true })))); expect(store.control()).toEqual({ enabled: true, revision: 1 }); await Promise.all(Array.from({ length: 20 }, () => broker.handleRequest(authenticatedRequest("control-set", { enabled: false })))); expect(store.control()).toEqual({ enabled: false, revision: 2 }); expect((store.db.query("SELECT COUNT(*) AS count FROM control_state").get() as any).count).toBe(1); store.close()
+})
+
+test("permission starts from allow, confirms quickly, and broker does not await a hung adapter", async () => {
+	const never = new Promise<void>(() => {}), adapter = new CountingAdapter(); adapter.slow = never; const { store, broker } = brokerWithAdapter(adapter)
+	const response = await Promise.race([broker.handleRequest(authenticatedRequest("permission-denied-notice", { rootSessionId: "root", permissionId: "slow" })), Bun.sleep(30).then(() => "timeout" as const)]); expect(response).not.toBe("timeout"); expect(adapter.attempts).toBe(1); expect((store.db.query("SELECT state FROM control_outbound WHERE dedupe_key='permission:slow'").get() as any).state).toBe("SENDING")
+	const timeoutHook = createPermissionHook(async () => "root", (async () => { throw new DOMException("timed out", "TimeoutError") }) as any, "e", "s", "i", "t"), output: any = { status: "allow" }; await timeoutHook({ sessionID: "root", id: "p" }, output); expect(output.status).toBe("ask"); store.close()
+})
+
+test("back during callback blocks direct send before adapter entry", async () => {
+	let release!: (value: Response) => void, entered!: () => void; const started = new Promise<void>((resolve) => { entered = resolve }), callback = new Promise<Response>((resolve) => { release = resolve })
+	const { store, adapter, broker } = readyBroker(async () => { entered(); return callback }); const running = broker.handleInbound({ id: "race", fromUserId: "user", contextToken: "ctx", text: "#1\nwork", cursorHint: "c" }); await started
+	await broker.handleRequest(authenticatedRequest("control-set", { enabled: false })); release(Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "late" })); expect((await running).reason).toBe("control-changed-before-send"); expect(adapter.sent).toHaveLength(0); expect(store.pendingState("race")).toBe("UNKNOWN"); store.close()
+})
+
+test("back cancels an ANSWERING checkpoint while callback is in flight", async () => {
+	let release!: (value: Response) => void, entered!: () => void; const started = new Promise<void>((resolve) => { entered = resolve }), callback = new Promise<Response>((resolve) => { release = resolve })
+	const { store, adapter, broker } = readyBroker(async () => { entered(); return callback }); store.updateContext(1, "ctx"); const opened = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "race-checkpoint", question: "q", choices: [] })), checkpointId = (await opened.json() as any).checkpointId
+	const running = broker.handleInbound({ id: "race-answer", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" }); await started; await broker.handleRequest(authenticatedRequest("control-set", { enabled: false })); release(Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "late" })); expect((await running).reason).toBe("control-changed-before-send"); expect(store.checkpointState(checkpointId)).toBe("CANCELLED"); expect(adapter.sent).toHaveLength(1); store.close()
+})
+
+test("checkpoint becomes ANSWERED after injection even when direct outbound is UNKNOWN", async () => {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "answer-a", text: "reply" })); store.updateContext(1, "ctx")
+	const opened = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "answer-call", question: "q", choices: [] })), checkpointId = (await opened.json() as any).checkpointId; adapter.failSend = true
+	expect((await broker.handleInbound({ id: "answer-in", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" })).reason).toBe("unknown-no-replay"); expect(store.checkpointState(checkpointId)).toBe("ANSWERED"); expect((store.db.query("SELECT state FROM outbound WHERE message_id='answer-a'").get() as any).state).toBe("UNKNOWN"); store.close()
+})
+
+test("checkpoint callback uncertainty stays UNKNOWN and blocks new requests until back", async () => {
+	const { store, broker } = readyBroker(async () => { throw new DOMException("timeout", "TimeoutError") }); store.updateContext(1, "ctx"); const opened = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "uncertain", question: "q", choices: [] })), checkpointId = (await opened.json() as any).checkpointId
+	await broker.handleInbound({ id: "uncertain-answer", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" }); expect(store.checkpointState(checkpointId)).toBe("UNKNOWN"); expect((await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "new-call", question: "q2", choices: [] }))).status).toBe(409); store.setControl(false); expect(store.checkpointState(checkpointId)).toBe("CANCELLED"); store.close()
+})
+
+test("callback UNKNOWN direct run is consumed without generic then next LOCAL run completes once", async () => {
+	const { store, adapter, broker } = readyBroker(async () => { throw new DOMException("timeout", "TimeoutError") })
+	await broker.handleInbound({ id: "direct-timeout", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" }); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct-a", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(0); expect((store.db.query("SELECT origin,running FROM session_activity").get() as any)).toMatchObject({ origin: "INBOUND:direct-timeout", running: 0 }); expect((store.db.query("SELECT COUNT(*) AS count FROM audit WHERE reason LIKE 'completion-suppressed:%'").get() as any).count).toBe(1)
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "local-after-timeout", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); store.close()
+})
+
+test("normal direct success is consumed without generic then next LOCAL run completes once", async () => {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "direct-success", text: "reply" })); await broker.handleInbound({ id: "direct-success-in", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" }); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct-success", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(0); expect((store.db.query("SELECT running FROM session_activity").get() as any).running).toBe(0)
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "local-after-direct", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); store.close()
+})
+
+test("completion excludes assistant IDs already owned by direct outbound", () => {
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", conversationId: "user" }); store.updateContext(1, "ctx"); store.setControl(true); store.observeStatus("root", "owner", "busy"); store.db.query("INSERT INTO outbound VALUES('same-assistant','inbound-x','SENT','#1\\nx',?)").run(new Date().toISOString()); store.observeAssistant("root", "owner", "same-assistant", false); store.observeStatus("root", "owner", "idle"); expect(store.claimCompletion("root", "owner")).toBeUndefined(); store.close()
+})
+
+test("echo fingerprint includes context, suppresses repeats throughout TTL, and expires", async () => {
+	const store = new Store(":memory:"); store.recordEcho("user", "ctx", "#1\nx", 100, 100); expect(store.matchesEcho("user", "ctx", "#1\nx", 150)).toBe(true); expect(store.matchesEcho("user", "ctx", "#1\nx", 160)).toBe(true); expect(store.matchesEcho("user", "other", "#1\nx", 160)).toBe(false); expect(store.matchesEcho("user", "ctx", "#1\nx", 201)).toBe(false); expect(store.sweepOutboundEchoes(201)).toBe(0); store.close()
+	const ready = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "reply" })); await ready.broker.handleInbound({ id: "source", fromUserId: "user", contextToken: "ctx", text: "#1\nstart", cursorHint: "a" }); const payload = ready.adapter.sent[0].text
+	for (const id of ["echo-1", "echo-2"]) expect((await ready.broker.handleInbound({ id, fromUserId: "user", contextToken: "ctx", text: payload, cursorHint: id })).reason).toBe("outbound-echo"); expect(ready.adapter.sent).toHaveLength(1); ready.store.close()
+})
+
+test("RPC rejects bad method, shared secret and instance token and reports live adapter", async () => {
+	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(), broker = new BrokerService(store, adapter, "secret", "worker", async () => Response.json({})); store.register("owner", "token", "http://127.0.0.1:1")
+	expect((await broker.handleRequest(new Request("http://127.0.0.1", { method: "GET" }))).status).toBe(405)
+	expect((await broker.handleRequest(new Request("http://127.0.0.1", { method: "POST", headers: { "x-wechat-control-key": "bad" }, body: "{}" }))).status).toBe(401)
+	expect((await broker.handleRequest(new Request("http://127.0.0.1", { method: "POST", headers: { "x-wechat-control-key": "secret" }, body: JSON.stringify({ method: "control-get", instanceId: "owner", instanceToken: "bad" }) }))).status).toBe(403)
+	adapter.statusValue = "Degraded"; const live = await broker.handleRequest(authenticatedRequest("control-get", { rootSessionId: "root" })); expect((await live.json() as any).adapter).toBe("Degraded"); store.close()
+})
+
+test("published plugin entry remains metadata-only and adapter command is configurable", async () => {
+	const source = await Bun.file(new URL("./index.ts", import.meta.url)).text()
+	expect(source).toContain("event:"); expect(source).not.toContain("session.messages"); expect(source).toContain("observe-assistant"); expect(source).toContain("observe-status"); expect(source).not.toContain("C:\\\\Users")
+	expect(resolveWeixinCommand(["node", path.resolve("custom", "weixin-mcp", "dist", "cli.js")])[0]).toBe("node"); expect(() => resolveWeixinCommand(["npx", "weixin-mcp"])).toThrow()
+})

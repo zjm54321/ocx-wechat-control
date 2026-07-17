@@ -1,0 +1,56 @@
+{
+  "name": "@zjm54321/ocx-wechat-control",
+  "version": "0.1.0",
+  "description": "Restricted WeChat takeover plugin for OpenCode",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./worker": "./dist/worker.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts ./src/worker.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin",
+    "test": "bun test ./src/core.test.ts",
+    "check": "bun run test && bun run build && bun -e \"import('./dist/index.js').then((m) => { if (typeof m.default !== 'function') process.exit(1); console.log('dist-import-ok') })\"",
+    "prepack": "bun run build"
+  },
+  "dependencies": {
+    "weixin-mcp": "1.7.7"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.19"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.14.19"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zjm54321/ocx-wechat-control.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zjm54321/ocx-wechat-control/issues"
+  },
+  "homepage": "https://github.com/zjm54321/ocx-wechat-control#readme",
+  "keywords": [
+    "opencode",
+    "wechat",
+    "bun",
+    "plugin"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

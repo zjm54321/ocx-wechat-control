@@ -1,6 +1,6 @@
 {
   "name": "@mingzzz/ocx-wechat-control",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Restricted WeChat takeover plugin for OpenCode",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,20 +18,27 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun build ./src/index.ts ./src/worker.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin",
-    "test": "bun test ./src/core.test.ts",
+    "build": "bun build ./src/index.ts ./src/worker.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk --external @opencode-ai/sdk/v2/client",
+    "test": "bun test ./src/core.test.ts ./src/typing.test.ts",
+    "test:broker": "bun test ./src/broker-flow.test.ts",
+    "test:callbacks": "bun test ./src/client-callback.test.ts ./src/plugin-startup.test.ts ./src/plugin-native.test.ts",
+    "test:integration": "bun test ./src/phase1f.integration.test.ts",
     "test:dist": "bun test ./src/dist-entry.test.ts",
-    "check": "bun run test && bun run build && bun run test:dist",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun run test && bun run test:broker && bun run test:callbacks && bun run test:integration && bun run build && bun run test:dist",
     "prepack": "bun run build"
   },
   "dependencies": {
+    "@opencode-ai/sdk": "1.14.19",
     "weixin-mcp": "1.7.7"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.14.19"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.14.19"
+    "@opencode-ai/plugin": "1.14.19",
+    "@types/bun": "1.2.22",
+    "typescript": "5.8.2"
   },
   "engines": {
     "bun": ">=1.3.14"

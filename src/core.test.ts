@@ -6,10 +6,10 @@ import * as path from "node:path"
 import { AdapterSendError, assertWeixinSendSuccess, JsonRpcPendingMap, MockWeChatAdapter, WeixinMcpAdapter, type McpClient } from "./adapter"
 import { BrokerService, clampCallbackTimeout } from "./broker"
 import { ClientLifecycleRegistry, createCallbackHandler, extractPromptAssistant, resolveRootSession } from "./client"
-import { CONTROL_OFF_TEXT, HELP_TEXT, MAX_CONTEXT_TOKEN_LENGTH, MAX_ROUTE_ID_LENGTH, PERMISSION_DENIED_TEXT, Store, formatOutbound, formatRegistrationList, parseInboundText, parsePollToolResult, sanitizeTitle } from "./core"
+import { CONTROL_OFF_TEXT, HELP_TEXT, MAX_CONTEXT_TOKEN_LENGTH, MAX_ROUTE_ID_LENGTH, PERMISSION_DENIED_TEXT, Store, allocateRequestCode, formatOutbound, formatRegistrationList, parseInboundText, parsePollToolResult, sanitizeTitle } from "./core"
 import { runWorker } from "./worker"
 import { decideExistingBroker, pidStatus, readLock } from "./worker-runtime"
-import { ControlCommandHandled, captureRequestInputCallID, createControlCommandHook, createControlEventHook, createPermissionHook, executeRequestInputTool, registerControlCommands, requestInputToolOutcome, resolveWeixinCommand } from "./plugin-runtime"
+import { ControlCommandHandled, captureReplyCallID, createControlCommandHook, createControlEventHook, createPermissionHook, registerControlCommands, resolveWeixinCommand } from "./plugin-runtime"
 
 const tempRoot = path.join(tmpdir(), "ocx-wechat-control-tests")
 mkdirSync(tempRoot, { recursive: true })
@@ -178,12 +178,12 @@ function readyBroker(fetcher: typeof fetch) {
 	return { store, adapter, broker: new BrokerService(store, adapter, "secret", "worker", fetcher) }
 }
 
-test("one inbound calls callback once, sends direct final once, and deduplicates", async () => {
+test("one inbound admits once without assistant body and deduplicates", async () => {
 	let callbacks = 0
-	const { store, adapter, broker } = readyBroker(async () => { callbacks++; return Response.json({ promptMessageId: "prompt", assistantMessageId: "assistant", text: "final" }) })
+	const { store, adapter, broker } = readyBroker(async () => { callbacks++; return Response.json({ ok: true, accepted: true }) })
 	const message = { id: "in", fromUserId: "user", contextToken: "ctx", text: "#1\nhello", cursorHint: "c" }
 	expect((await broker.handleInbound(message)).ok).toBe(true); expect((await broker.handleInbound(message)).reason).toBe("duplicate-at-least-once-key")
-	expect(callbacks).toBe(1); expect(adapter.sent).toEqual([{ to: "user", text: "#1\nfinal", contextToken: "ctx" }]); expect(store.pendingState("in")).toBe("SENT"); store.close()
+	expect(callbacks).toBe(1); expect(adapter.sent).toHaveLength(0); expect(store.promptSubmission("in")?.state).toBe("SUBMITTED"); expect((store.db.query("SELECT COUNT(*) AS count FROM pending_replies").get() as any).count).toBe(0); store.close()
 })
 
 test("callback timeout and invalid direct result become UNKNOWN without replay", async () => {
@@ -192,7 +192,7 @@ test("callback timeout and invalid direct result become UNKNOWN without replay",
 		async () => Response.json({ promptMessageId: "p", assistantMessageId: "a" }),
 	]) {
 		const { store, adapter, broker } = readyBroker(fetcher as typeof fetch); const result = await broker.handleInbound({ id: crypto.randomUUID(), fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" })
-		expect(result.reason).toBe("callback-failed-or-timeout"); expect(adapter.sent).toHaveLength(0); expect(store.state((store.db.query("SELECT message_id AS id FROM inbound").get() as any).id)).toBe("UNKNOWN"); store.close()
+		expect(result.reason).toBe("unknown-no-replay"); expect(adapter.sent).toHaveLength(0); expect(store.state((store.db.query("SELECT message_id AS id FROM inbound").get() as any).id)).toBe("UNKNOWN"); store.close()
 	}
 	expect(clampCallbackTimeout(1)).toBe(30_000); expect(clampCallbackTimeout(99_999_999)).toBe(600_000)
 })
@@ -223,7 +223,7 @@ function createWalV2(filename: string): Database {
 
 test("WAL-consistent legacy-to-v5 snapshot preserves registrations and sequence", () => {
 	const filename = tempFile("wal-v2"), writer = createWalV2(filename), store = new Store(filename); const backup = store.migrationBackupPath
-	expect(backup).toBeDefined(); expect(backup).toContain("pre-v5"); expect(store.bindingForAlias(7)?.rootSessionId).toBe("root-wal"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(5); expect(store.control()).toEqual({ enabled: false, revision: 0 }); expect(store.route()).toMatchObject({ conversationId: "conversation-wal", contextToken: null })
+	expect(backup).toBeDefined(); expect(backup).toContain("pre-v5"); expect(store.bindingForAlias(7)?.rootSessionId).toBe("root-wal"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6); expect(store.control()).toEqual({ enabled: false, revision: 0 }); expect(store.route()).toMatchObject({ conversationId: "conversation-wal", contextToken: null })
 	expect((store.db.query("PRAGMA table_info(session_activity)").all() as any[]).map((row) => row.name)).toContain("epoch"); expect((store.db.query("PRAGMA table_info(checkpoints)").all() as any[]).map((row) => row.name)).toContain("request_key"); expect((store.db.query("PRAGMA table_info(outbound_echoes)").all() as any[]).map((row) => row.name)).toContain("expires_ms")
 	const snapshot = new Database(backup!); expect((snapshot.query("SELECT value FROM meta WHERE key='custom'").get() as any).value).toBe("wal-data"); expect((snapshot.query("SELECT conversation_id AS value FROM bindings WHERE alias=7").get() as any).value).toBe("conversation-wal"); expect(snapshot.query("SELECT 1 FROM pending_replies WHERE inbound_id='pending-wal'").get()).toBeDefined(); snapshot.close()
 	expect(store.bind({ rootSessionId: "root-two", directory: "d", ownerInstance: "owner" }).alias).toBe(8)
@@ -244,9 +244,9 @@ function createWalV4(filename: string): Database {
 
 test("v4-to-v5 migration snapshots once and preserves alias sequence", () => {
 	const filename = tempFile("wal-v4"), writer = createWalV4(filename), store = new Store(filename), backup = store.migrationBackupPath
-	expect(backup).toContain("pre-v5"); expect(store.bindingForAlias(12)).toMatchObject({ rootSessionId: "root-v4", directory: "dir-v4", ownerInstance: "owner-v4", title: null }); expect(store.route()).toMatchObject({ conversationId: "recipient-v4", contextToken: null }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(5)
+	expect(backup).toContain("pre-v5"); expect(store.bindingForAlias(12)).toMatchObject({ rootSessionId: "root-v4", directory: "dir-v4", ownerInstance: "owner-v4", title: null }); expect(store.route()).toMatchObject({ conversationId: "recipient-v4", contextToken: null }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6)
 	expect(store.bind({ rootSessionId: "next-v5", directory: "d", ownerInstance: "o" }).alias).toBe(13); store.close(); writer.close()
-	const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect((reopened.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("5"); reopened.close(); cleanup(filename, backup)
+	const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect((reopened.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("6"); reopened.close(); cleanup(filename, backup)
 })
 
 test("v4 multiple conversations migrate fail-closed and alias holes advance from max", () => {
@@ -258,7 +258,7 @@ test("v4 multiple conversations migrate fail-closed and alias holes advance from
 
 test("old deployed v3 receives a pre-v5 snapshot and preserves control/pending/checkpoint data", () => {
 	const filename = tempFile("wal-v3"), writer = createWalV3(filename), store = new Store(filename), backup = store.migrationBackupPath
-	expect(backup).toContain("pre-v5"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(5); expect(store.bindingForAlias(4)?.rootSessionId).toBe("root-v3"); expect(store.control()).toEqual({ enabled: true, revision: 17 }); expect(store.pendingState("in-v3")).toBe("UNKNOWN"); expect(store.checkpointState("cp-v3")).toBe("UNKNOWN"); expect(store.checkpointForRequest("cp-v3", "root-v3")?.checkpointId).toBe("cp-v3")
+	expect(backup).toContain("pre-v5"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6); expect(store.bindingForAlias(4)?.rootSessionId).toBe("root-v3"); expect(store.control()).toEqual({ enabled: true, revision: 17 }); expect(store.pendingState("in-v3")).toBe("UNKNOWN"); expect(store.checkpointState("cp-v3")).toBe("CANCELLED"); expect(store.checkpointForRequest("cp-v3", "root-v3")?.checkpointId).toBe("cp-v3")
 	const snapshot = new Database(backup!); expect((snapshot.query("PRAGMA user_version").get() as any).user_version).toBe(3); expect((snapshot.query("SELECT revision FROM control_state").get() as any).revision).toBe(17); expect((snapshot.query("SELECT state FROM pending_replies WHERE inbound_id='in-v3'").get() as any).state).toBe("UNKNOWN"); expect((snapshot.query("SELECT state FROM checkpoints WHERE checkpoint_id='cp-v3'").get() as any).state).toBe("UNKNOWN"); snapshot.close()
 	store.close(); writer.close(); const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect(reopened.control().revision).toBe(17); reopened.close(); cleanup(filename, backup)
 })
@@ -305,8 +305,12 @@ test("live owner blocks rebind; stale exact-root rebind clears checkpoint and ac
 	const request = (instanceId: string, instanceToken: string, rootSessionId = "root") => new Request("http://127.0.0.1", { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret" }, body: JSON.stringify({ method: "leave-root", instanceId, instanceToken, rootSessionId, directory: "d", title: instanceId }) })
 	expect((await broker.handleRequest(request("old", "old-token"))).status).toBe(200); store.refreshRoute("controller", "ctx"); const revision = store.control().revision
 	expect(store.openCheckpoint({ checkpointId: "rebind-cp", requestKey: "rebind-key", root: "root", owner: "old", alias: 1, question: "q", choices: [], revision })).toBe(true); store.observeStatus("root", "old", "busy"); store.beginInbound({ id: "old-flight", fromUserId: "controller", contextToken: "ctx", text: "#1\nx", cursorHint: "x" }); store.beginPending("old-flight", "root", 1, revision)
+	store.openNativeRequest({ requestId: "rebind-native", requestKey: "rebind-native-key", root: "root", owner: "old", alias: 1, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement("rebind-native", true); store.claimPromptSubmission({ submissionId: "rebind-prompt", inboundId: "rebind-prompt-in", root: "root", owner: "old", alias: 1, messageId: "rebind-message", body: "x" }); store.beginRuntimeAdmission("rebind-prompt", "root", "old")
+	store.bind({ rootSessionId: "other-root", directory: "d", ownerInstance: "next" }); store.claimPromptSubmission({ submissionId: "other-prompt", inboundId: "other-in", root: "other-root", owner: "next", alias: 2, messageId: "other-message", body: "x" }); const otherGeneration = store.beginRuntimeAdmission("other-prompt", "other-root", "next")!; store.observeRuntimeStatus("other-root", "next", "BUSY", otherGeneration); expect(store.desiredTyping()).toBe(true)
 	const live = await broker.handleRequest(request("next", "next-token")); expect(live.status).toBe(409); expect(await live.json()).toMatchObject({ error: "owner-live" }); expect(store.bindingForRoot("root")?.ownerInstance).toBe("old"); expect(store.pendingState("old-flight")).toBe("WAITING")
 	store.unregister("old", "old-token"); expect((await broker.handleRequest(request("next", "next-token"))).status).toBe(200); expect(store.bindingForRoot("root")?.ownerInstance).toBe("next"); expect(store.checkpointState("rebind-cp")).toBe("CANCELLED"); expect((store.db.query("SELECT running,origin,owner_instance AS owner FROM session_activity WHERE root_session_id='root'").get() as any)).toMatchObject({ running: 0, origin: "NONE", owner: "next" }); expect(store.pendingState("old-flight")).toBe("UNKNOWN"); expect(store.state("old-flight")).toBe("UNKNOWN"); expect((store.db.query("SELECT reason FROM inbound WHERE message_id='old-flight'").get() as any).reason).toBe("owner-rebound")
+	expect(store.nativeRequest("rebind-native")?.state).toBe("CANCELLED_REMOTE"); expect(store.promptSubmission("rebind-prompt")?.state).toBe("CANCELLED"); expect(store.runtime("root")).toMatchObject({ ownerInstance: "next", status: "IDLE", workPending: false })
+	expect(store.runtime("other-root")?.workPending).toBe(true); expect(store.typingDesired()).toBe(true)
 	expect(store.completePendingAndClaim("old", "root", "old-flight", "p", "a", "late", store.control().revision)).toBeUndefined(); store.close()
 })
 
@@ -328,17 +332,14 @@ test("global control revision, back cancellation and v3 crash recovery are durab
 	const reopened = new Store(filename); expect((reopened.db.query("SELECT state FROM control_outbound WHERE dedupe_key='d'").get() as any).state).toBe("UNKNOWN"); reopened.close(); cleanup(filename)
 })
 
-test("checkpoint is asynchronous, answer targets exact binding, and failures never replay", async () => {
-	let envelope: any
-	const { store, adapter, broker } = readyBroker(async (_url, init) => { envelope = JSON.parse(String(init?.body)).envelope; return Response.json({ promptMessageId: "prompt", assistantMessageId: "direct", text: "accepted" }) })
+test("legacy checkpoint stays historical while ordinary answer uses prompt admission", async () => {
+	let callbackPath = ""
+	const { store, adapter, broker } = readyBroker(async (url) => { callbackPath = String(url); return Response.json({ ok: true, accepted: true }) })
 	store.refreshRoute("user", "ctx")
 	const response = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "call-checkpoint", question: "Choose", choices: ["A", "B"] })); expect(response.status).toBe(200)
 	const checkpointId = (await response.json() as any).checkpointId; expect(store.checkpointState(checkpointId)).toBe("OPEN"); expect(adapter.sent[0].to).toBe("user"); expect(adapter.sent[0].text).toContain("1. A")
-	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "tool-turn", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); expect(adapter.sent).toHaveLength(1)
 	const result = await broker.handleInbound({ id: "answer", fromUserId: "user", contextToken: "ctx2", text: "#1\nB", cursorHint: "c" })
-	expect(result.ok).toBe(true); expect(envelope).toEqual({ kind: "checkpoint", checkpointId }); expect(store.checkpointState(checkpointId)).toBe("ANSWERED"); expect(adapter.sent.at(-1)?.text).toBe("#1\naccepted")
-	await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(0); expect((store.db.query("SELECT running FROM session_activity").get() as any).running).toBe(0)
-	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "local-after-checkpoint", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1)
+	expect(result.ok).toBe(true); expect(callbackPath).toEndWith("/submit-prompt"); expect(store.checkpointState(checkpointId)).toBe("OPEN"); expect(store.promptSubmission("answer")?.state).toBe("SUBMITTED"); expect(adapter.sent).toHaveLength(1)
 	expect((await broker.handleInbound({ id: "answer", fromUserId: "user", contextToken: "ctx2", text: "#1\nB", cursorHint: "c" })).reason).toBe("duplicate-at-least-once-key"); store.close()
 })
 
@@ -352,18 +353,17 @@ test("back refuses inbound/checkpoints/permission/completion while help remains 
 	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "a", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); expect(adapter.sent).toHaveLength(2); store.close()
 })
 
-test("permission denial and terminal completion use fixed durable dedupe messages", async () => {
+test("permission denial remains fixed while completion observers never send", async () => {
 	const { store, adapter, broker } = readyBroker(async () => Response.json({})); store.refreshRoute("user", "ctx")
 	const permission = await broker.handleRequest(authenticatedRequest("permission-denied-notice", { rootSessionId: "root", permissionId: "perm" })); expect((await permission.json() as any).handled).toBe(true); await broker.drainBackground(); expect(adapter.sent[0].text).toBe(`#1\n${PERMISSION_DENIED_TEXT}`)
 	await broker.handleRequest(authenticatedRequest("permission-denied-notice", { rootSessionId: "root", permissionId: "perm" })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(1)
 	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "terminal", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" }))
-	await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); expect((store.db.query("SELECT state FROM control_outbound WHERE kind='completion'").get() as any).state).toBe("SENT"); store.close()
+	await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(0); expect(store.db.query("SELECT state FROM control_outbound WHERE kind='completion'").get()).toBeNull(); store.close()
 })
 
 test("exact outbound echoes are suppressed before routing", async () => {
-	const { store, adapter, broker } = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "direct", text: "reply" }))
-	await broker.handleInbound({ id: "one", fromUserId: "user", contextToken: "ctx", text: "#1\nhello", cursorHint: "a" }); const payload = adapter.sent[0].text
-	const echoed = await broker.handleInbound({ id: "echo", fromUserId: "user", contextToken: "ctx", text: payload, cursorHint: "b" }); expect(echoed.reason).toBe("outbound-echo"); expect(adapter.sent).toHaveLength(1); expect(store.state("echo")).toBe("UNKNOWN"); store.close()
+	const { store, adapter, broker } = readyBroker(async () => Response.json({ ok: true, accepted: true })), payload = "#1\nreply"; store.recordEcho("user", "ctx", payload)
+	const echoed = await broker.handleInbound({ id: "echo", fromUserId: "user", contextToken: "ctx", text: payload, cursorHint: "b" }); expect(echoed.reason).toBe("outbound-echo"); expect(adapter.sent).toHaveLength(0); expect(store.state("echo")).toBe("UNKNOWN"); store.close()
 })
 
 test("commands are conflict-safe, clear sentinels, reject arguments and always throw handled", async () => {
@@ -381,8 +381,8 @@ test("leave rejects child sessions before RPC", async () => {
 	await expect(hook({ command: "leave", arguments: "", sessionID: "child" }, { parts: [1] })).rejects.toBeInstanceOf(ControlCommandHandled); expect(calls).toBe(0)
 })
 
-test("permission hook denies only authenticated routed handling and RPC failure stays ask", async () => {
-	const calls: any[] = [], deny = createPermissionHook(async () => "root", (async (_e: string, _s: string, body: any) => { calls.push(body); return body.method === "control-get" ? { enabled: true, routable: true } : { handled: true } }) as any, "e", "s", "i", "t"), denied: any = { status: "allow" }; await deny({ sessionID: "child", id: "p" }, denied); expect(denied.status).toBe("deny"); await Bun.sleep(0); expect(calls.map((item) => item.method)).toEqual(["control-get", "permission-denied-notice"])
+test("permission hook always leaves controlled permission at native ask", async () => {
+	const calls: any[] = [], ask = createPermissionHook(async () => "root", (async (_e: string, _s: string, body: any) => { calls.push(body); return { enabled: true, routable: true } }) as any, "e", "s", "i", "t"), output: any = { status: "allow" }; await ask({ sessionID: "child", id: "p" }, output); expect(output.status).toBe("ask"); expect(calls).toHaveLength(0)
 	const unavailable = createPermissionHook(async () => "root", (async () => { throw new Error("down") }) as any, "e", "s", "i", "t"), asked: any = { status: "allow" }; await unavailable({ sessionID: "child", id: "p" }, asked); expect(asked.status).toBe("ask")
 })
 
@@ -399,43 +399,43 @@ async function runCompletionOrder(events: Array<["status", "busy" | "idle"] | ["
 	await broker.drainBackground(); return { store, adapter, broker }
 }
 
-test("completion claims all supported orderings and duplicate busy never clears candidate", async () => {
+test("legacy completion observers are accepted but never dispatch", async () => {
 	for (const events of [
 		[["status", "busy"], ["assistant", "a"], ["status", "idle"]],
 		[["status", "busy"], ["status", "idle"], ["assistant", "a"]],
 		[["status", "busy"], ["assistant", "a"], ["status", "busy"], ["status", "idle"]],
 		[["status", "busy"], ["assistant", "a"], ["assistant", "a"], ["status", "idle"], ["status", "idle"]],
 	] as any[]) {
-		const { store, adapter } = await runCompletionOrder(events); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); expect((store.db.query("SELECT run_id AS runId FROM session_activity").get() as any).runId).toBe(1); store.close()
+		const { store, adapter } = await runCompletionOrder(events); expect(adapter.sent).toHaveLength(0); expect(store.db.query("SELECT 1 FROM session_activity").get()).toBeNull(); store.close()
 	}
 })
 
-test("same assistant cannot complete twice across a late duplicate run", async () => {
-	const { store, adapter, broker } = await runCompletionOrder([["status", "busy"], ["assistant", "same"], ["status", "idle"]]); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "same", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(1); store.close()
+test("duplicate assistant observers remain no-op", async () => {
+	const { store, adapter, broker } = await runCompletionOrder([["status", "busy"], ["assistant", "same"], ["status", "idle"]]); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "same", failed: false })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(0); store.close()
 })
 
 test("assistant preserves idle, child events stay child and cannot complete a bound root", async () => {
 	const { store, adapter, broker } = readyBroker(async () => Response.json({})); store.refreshRoute("user", "ctx")
-	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "late", failed: false })); expect((store.db.query("SELECT idle FROM session_activity").get() as any).idle).toBe(1); await broker.drainBackground(); expect(adapter.sent).toHaveLength(1)
+	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "late", failed: false })); expect(store.db.query("SELECT 1 FROM session_activity").get()).toBeNull(); await broker.drainBackground(); expect(adapter.sent).toHaveLength(0)
 	const calls: any[] = [], hook = createControlEventHook((async (_e: string, _s: string, body: any) => { calls.push(body); if (body.status === "busy") await Bun.sleep(5); return {} }) as any, "e", "s", "owner", "token")
 	await Promise.all([hook({ event: { type: "session.status", properties: { sessionID: "child", status: { type: "busy" } } } }), hook({ event: { type: "message.updated", properties: { info: { role: "assistant", sessionID: "child", id: "child-a", time: { completed: 1 } } } } })]); expect(calls.map((item) => item.rootSessionId)).toEqual(["child", "child"]); expect(calls.map((item) => item.method)).toEqual(["observe-status", "observe-assistant"])
 	const childResponse = await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "child", status: "busy" })); expect((await childResponse.json() as any).observed).toBe(false); store.close()
 })
 
 class CountingAdapter extends MockWeChatAdapter { attempts = 0; slow?: Promise<void>; override async send(to: string, text: string, contextToken: string): Promise<void> { this.attempts++; if (this.slow) return this.slow; return super.send(to, text, contextToken) } }
-function brokerWithAdapter(adapter: MockWeChatAdapter, fetcher: typeof fetch = async () => Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "ok" })) { const store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.refreshRoute("user", "ctx"); store.setControl(true); return { store, broker: new BrokerService(store, adapter, "secret", "worker", fetcher) } }
+function brokerWithAdapter(adapter: MockWeChatAdapter, fetcher: typeof fetch = async () => Response.json({ ok: true, accepted: true })) { const store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.refreshRoute("user", "ctx"); store.setControl(true); return { store, broker: new BrokerService(store, adapter, "secret", "worker", fetcher) } }
 
 test("locked controller alone refreshes context, receives replies and consumes checkpoints", async () => {
 	let callbacks = 0
 	const adapter = new CountingAdapter(), store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "Root" })
-	const broker = new BrokerService(store, adapter, "secret", "worker", async () => { callbacks++; return Response.json({ promptMessageId: "p", assistantMessageId: `a-${callbacks}`, text: "ok" }) })
+	const broker = new BrokerService(store, adapter, "secret", "worker", async () => { callbacks++; return Response.json({ ok: true, accepted: true }) })
 	await broker.handleInbound({ id: "claim", fromUserId: "controller", contextToken: "c1", text: "id", cursorHint: "1" }); const sentAfterClaim = adapter.attempts
 	for (const [id, text] of [["other-id", "id"], ["other-help", "help"], ["other-route", "#1\nx"]]) expect((await broker.handleInbound({ id, fromUserId: "other", contextToken: "evil", text, cursorHint: id })).reason).toBe("route-rejected")
 	expect(adapter.attempts).toBe(sentAfterClaim); expect(callbacks).toBe(0); expect(store.route()).toMatchObject({ conversationId: "controller", contextToken: "c1" })
 	const revision = store.control().revision; expect(store.openCheckpoint({ checkpointId: "locked-cp", requestKey: "locked-call", root: "root", owner: "owner", alias: 1, question: "q", choices: [], revision })).toBe(true); expect(store.activateCheckpoint("locked-cp")).toBe(true)
 	await broker.handleInbound({ id: "attacker-answer", fromUserId: "other", contextToken: "evil2", text: "#1\na", cursorHint: "5" }); expect(store.checkpointState("locked-cp")).toBe("OPEN")
 	await broker.handleInbound({ id: "controller-help", fromUserId: "controller", contextToken: "c2", text: "help", cursorHint: "6" }); expect(store.route()).toMatchObject({ conversationId: "controller", contextToken: "c2" }); expect(adapter.sent.at(-1)).toMatchObject({ to: "controller", contextToken: "c2", text: HELP_TEXT })
-	await broker.handleInbound({ id: "controller-answer", fromUserId: "controller", contextToken: "c3", text: "#1\na", cursorHint: "7" }); expect(store.checkpointState("locked-cp")).toBe("ANSWERED"); expect(adapter.sent.at(-1)).toMatchObject({ to: "controller", contextToken: "c3", text: "#1\nok" }); store.close()
+	await broker.handleInbound({ id: "controller-answer", fromUserId: "controller", contextToken: "c3", text: "#1\na", cursorHint: "7" }); expect(store.checkpointState("locked-cp")).toBe("OPEN"); expect(store.promptSubmission("controller-answer")?.state).toBe("SUBMITTED"); expect(callbacks).toBe(1); store.close()
 })
 
 test("failed id list is durable UNKNOWN and duplicate never resends", async () => {
@@ -454,15 +454,8 @@ test("request-input validates content/readiness and UNKNOWN request keys never r
 	adapter.statusValue = "Degraded"; expect((await request("degraded", "q")).status).toBe(503); expect(store.checkpointForRequest("degraded", "root", "owner")).toBeUndefined(); store.close()
 })
 
-test("request-input tool converts UNKNOWN and thrown RPC into fixed no-retry endings", async () => {
-	expect(await requestInputToolOutcome(async () => ({ state: "UNKNOWN" }))).toContain("禁止重复发送")
-	expect(await requestInputToolOutcome(async () => { throw new Error("timeout") })).toContain("禁止重复发送")
-	expect(await requestInputToolOutcome(async () => ({ state: "OPEN" }))).toContain("立即结束本回合")
-})
-
-test("actual tool before-to-execute bridge preserves the stable callID request key", async () => {
-	const args: any = { question: "q", choices: [] }, output = { args }; captureRequestInputCallID({ tool: "wechat_request_input", callID: "call-stable", sessionID: "root" }, output); let received = ""
-	const result = await executeRequestInputTool(args, { sessionID: "root", messageID: "message" }, async (requestKey) => { received = requestKey; return { state: "OPEN" } }); expect(received).toBe("call-stable"); expect(result).toContain("立即结束本回合")
+test("wechat reply tool call ID capture is explicit and bounded", () => {
+	const output = { args: {} }; captureReplyCallID({ tool: "wechat_reply", callID: "call-stable" }, output); expect(output.args).toEqual({ __wechatCallID: "call-stable" }); captureReplyCallID({ tool: "other", callID: "ignored" }, output); expect(output.args.__wechatCallID).toBe("call-stable")
 })
 
 test("request-key replay survives owner rebind, validates current owner, and never resends", async () => {
@@ -489,35 +482,33 @@ test("permission starts from allow, confirms quickly, and broker does not await 
 test("back during callback blocks direct send before adapter entry", async () => {
 	let release!: (value: Response) => void, entered!: () => void; const started = new Promise<void>((resolve) => { entered = resolve }), callback = new Promise<Response>((resolve) => { release = resolve })
 	const { store, adapter, broker } = readyBroker(async () => { entered(); return callback }); const running = broker.handleInbound({ id: "race", fromUserId: "user", contextToken: "ctx", text: "#1\nwork", cursorHint: "c" }); await started
-	await broker.handleRequest(authenticatedRequest("back-global")); release(Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "late" })); expect((await running).reason).toBe("control-changed-before-send"); expect(adapter.sent).toHaveLength(0); expect(store.pendingState("race")).toBe("UNKNOWN"); store.close()
+	await broker.handleRequest(authenticatedRequest("back-global")); release(Response.json({ ok: true, accepted: true })); expect((await running).reason).toBe("control-changed-after-admission"); expect(adapter.sent).toHaveLength(0); expect(store.promptSubmission("race")?.state).toBe("UNKNOWN"); store.close()
 })
 
-test("back cancels an ANSWERING checkpoint while callback is in flight", async () => {
+test("back cancels legacy checkpoint while prompt admission is in flight", async () => {
 	let release!: (value: Response) => void, entered!: () => void; const started = new Promise<void>((resolve) => { entered = resolve }), callback = new Promise<Response>((resolve) => { release = resolve })
 	const { store, adapter, broker } = readyBroker(async () => { entered(); return callback }); store.refreshRoute("user", "ctx"); const opened = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "race-checkpoint", question: "q", choices: [] })), checkpointId = (await opened.json() as any).checkpointId
-	const running = broker.handleInbound({ id: "race-answer", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" }); await started; await broker.handleRequest(authenticatedRequest("back-global")); release(Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "late" })); expect((await running).reason).toBe("control-changed-before-send"); expect(store.checkpointState(checkpointId)).toBe("CANCELLED"); expect(adapter.sent).toHaveLength(1); store.close()
+	const running = broker.handleInbound({ id: "race-answer", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" }); await started; await broker.handleRequest(authenticatedRequest("back-global")); release(Response.json({ ok: true, accepted: true })); expect((await running).reason).toBe("control-changed-after-admission"); expect(store.checkpointState(checkpointId)).toBe("CANCELLED"); expect(adapter.sent).toHaveLength(1); store.close()
 })
 
-test("checkpoint becomes ANSWERED after injection even when direct outbound is UNKNOWN", async () => {
-	const { store, adapter, broker } = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "answer-a", text: "reply" })); store.refreshRoute("user", "ctx")
-	const opened = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "answer-call", question: "q", choices: [] })), checkpointId = (await opened.json() as any).checkpointId; adapter.failSend = true
-	expect((await broker.handleInbound({ id: "answer-in", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" })).reason).toBe("unknown-no-replay"); expect(store.checkpointState(checkpointId)).toBe("ANSWERED"); expect((store.db.query("SELECT state FROM outbound WHERE message_id='answer-a'").get() as any).state).toBe("UNKNOWN"); store.close()
+test("legacy checkpoint remains OPEN when ordinary prompt admission is uncertain", async () => {
+	const { store, broker } = readyBroker(async () => Response.json({ error: "uncertain" }, { status: 409 })); store.refreshRoute("user", "ctx")
+	const opened = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "answer-call", question: "q", choices: [] })), checkpointId = (await opened.json() as any).checkpointId
+	expect((await broker.handleInbound({ id: "answer-in", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" })).reason).toBe("unknown-no-replay"); expect(store.checkpointState(checkpointId)).toBe("OPEN"); expect(store.promptSubmission("answer-in")?.state).toBe("UNKNOWN"); store.close()
 })
 
-test("checkpoint callback uncertainty stays UNKNOWN and blocks new requests until back", async () => {
+test("prompt callback uncertainty does not consume legacy checkpoint", async () => {
 	const { store, broker } = readyBroker(async () => { throw new DOMException("timeout", "TimeoutError") }); store.refreshRoute("user", "ctx"); const opened = await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "uncertain", question: "q", choices: [] })), checkpointId = (await opened.json() as any).checkpointId
-	await broker.handleInbound({ id: "uncertain-answer", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" }); expect(store.checkpointState(checkpointId)).toBe("UNKNOWN"); expect((await broker.handleRequest(authenticatedRequest("request-input", { rootSessionId: "root", requestKey: "new-call", question: "q2", choices: [] }))).status).toBe(409); store.setControl(false); expect(store.checkpointState(checkpointId)).toBe("CANCELLED"); store.close()
+	await broker.handleInbound({ id: "uncertain-answer", fromUserId: "user", contextToken: "ctx", text: "#1\na", cursorHint: "c" }); expect(store.checkpointState(checkpointId)).toBe("OPEN"); expect(store.promptSubmission("uncertain-answer")?.state).toBe("UNKNOWN"); store.setControl(false); expect(store.checkpointState(checkpointId)).toBe("CANCELLED"); store.close()
 })
 
-test("callback UNKNOWN direct run is consumed without generic then next LOCAL run completes once", async () => {
+test("callback UNKNOWN and later observer events never emit generic completion", async () => {
 	const { store, adapter, broker } = readyBroker(async () => { throw new DOMException("timeout", "TimeoutError") })
-	await broker.handleInbound({ id: "direct-timeout", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" }); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct-a", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(0); expect((store.db.query("SELECT origin,running FROM session_activity").get() as any)).toMatchObject({ origin: "INBOUND:direct-timeout", running: 0 }); expect((store.db.query("SELECT COUNT(*) AS count FROM audit WHERE reason LIKE 'completion-suppressed:%'").get() as any).count).toBe(1)
-	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "local-after-timeout", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); store.close()
+	await broker.handleInbound({ id: "direct-timeout", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" }); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct-a", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(0); expect(store.db.query("SELECT 1 FROM session_activity").get()).toBeNull(); store.close()
 })
 
-test("normal direct success is consumed without generic then next LOCAL run completes once", async () => {
-	const { store, adapter, broker } = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "direct-success", text: "reply" })); await broker.handleInbound({ id: "direct-success-in", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" }); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct-success", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(0); expect((store.db.query("SELECT running FROM session_activity").get() as any).running).toBe(0)
-	await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "local-after-direct", failed: false })); await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "idle" })); await broker.drainBackground(); expect(adapter.sent.filter((item) => item.text === "#1\n任务已完成。")).toHaveLength(1); store.close()
+test("normal admission never creates direct-reply or completion state", async () => {
+	const { store, adapter, broker } = readyBroker(async () => Response.json({ ok: true, accepted: true })); await broker.handleInbound({ id: "direct-success-in", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "c" }); await broker.handleRequest(authenticatedRequest("observe-assistant", { rootSessionId: "root", assistantMessageId: "direct-success", failed: false })); await broker.drainBackground(); expect(adapter.sent).toHaveLength(0); expect(store.db.query("SELECT 1 FROM pending_replies").get()).toBeNull(); expect(store.db.query("SELECT 1 FROM outbound").get()).toBeNull(); store.close()
 })
 
 test("completion excludes assistant IDs already owned by direct outbound", () => {
@@ -526,8 +517,8 @@ test("completion excludes assistant IDs already owned by direct outbound", () =>
 
 test("echo fingerprint includes context, suppresses repeats throughout TTL, and expires", async () => {
 	const store = new Store(":memory:"); store.recordEcho("user", "ctx", "#1\nx", 100, 100); expect(store.matchesEcho("user", "ctx", "#1\nx", 150)).toBe(true); expect(store.matchesEcho("user", "ctx", "#1\nx", 160)).toBe(true); expect(store.matchesEcho("user", "other", "#1\nx", 160)).toBe(false); expect(store.matchesEcho("user", "ctx", "#1\nx", 201)).toBe(false); expect(store.sweepOutboundEchoes(201)).toBe(0); store.close()
-	const ready = readyBroker(async () => Response.json({ promptMessageId: "p", assistantMessageId: "a", text: "reply" })); await ready.broker.handleInbound({ id: "source", fromUserId: "user", contextToken: "ctx", text: "#1\nstart", cursorHint: "a" }); const payload = ready.adapter.sent[0].text
-	for (const id of ["echo-1", "echo-2"]) expect((await ready.broker.handleInbound({ id, fromUserId: "user", contextToken: "ctx", text: payload, cursorHint: id })).reason).toBe("outbound-echo"); expect(ready.adapter.sent).toHaveLength(1); ready.store.close()
+	const ready = readyBroker(async () => Response.json({ ok: true, accepted: true })), payload = "#1\nreply"; ready.store.recordEcho("user", "ctx", payload)
+	for (const id of ["echo-1", "echo-2"]) expect((await ready.broker.handleInbound({ id, fromUserId: "user", contextToken: "ctx", text: payload, cursorHint: id })).reason).toBe("outbound-echo"); expect(ready.adapter.sent).toHaveLength(0); ready.store.close()
 })
 
 test("RPC rejects bad method, shared secret and instance token and reports live adapter", async () => {
@@ -542,4 +533,58 @@ test("plugin implementation remains metadata-only and adapter command is configu
 	const source = await Bun.file(new URL("./plugin-runtime.ts", import.meta.url)).text()
 	expect(source).toContain("event:"); expect(source).not.toContain("session.messages"); expect(source).toContain("observe-assistant"); expect(source).toContain("observe-status"); expect(source).not.toContain("C:\\\\Users")
 	expect(resolveWeixinCommand(["node", path.resolve("custom", "weixin-mcp", "dist", "cli.js")])[0]).toBe("node"); expect(() => resolveWeixinCommand(["npx", "weixin-mcp"])).toThrow()
+})
+
+test("clean schema v6 has bounded state tables, metadata and AUTOINCREMENT holes", () => {
+	const store = new Store(":memory:")
+	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6); expect((store.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("6")
+	for (const table of ["prompt_submissions", "native_requests", "root_runtime", "typing_state"]) expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)).toBeDefined()
+	store.bind({ rootSessionId: "one", directory: "d", ownerInstance: "o" }); store.bind({ rootSessionId: "hole", directory: "d", ownerInstance: "o" }); store.db.query("DELETE FROM bindings WHERE root_session_id='hole'").run(); expect(store.bind({ rootSessionId: "three", directory: "d", ownerInstance: "o" }).alias).toBe(3)
+	expect(() => store.db.query("UPDATE typing_state SET desired=2").run()).toThrow(); store.close()
+})
+
+test("v5 to v6 snapshot preserves history and cancels only active legacy work without replay", () => {
+	const filename = tempFile("v5-v6"), seed = new Store(filename); seed.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); seed.refreshRoute("recipient", "context"); const revision = seed.control().revision
+	seed.beginInbound({ id: "legacy", fromUserId: "recipient", contextToken: "context", text: "#1\nx", cursorHint: "c" }); seed.beginPending("legacy", "root", 1, revision)
+	seed.db.query("INSERT INTO checkpoints(checkpoint_id,request_key,root_session_id,owner_instance,conversation_id,alias,question,choices_json,state,inbound_id,control_revision,created_at,updated_at) VALUES('active','active','root','owner','recipient',1,'q','[]','OPEN',NULL,?,'now','now')").run(revision)
+	seed.db.query("INSERT INTO checkpoints(checkpoint_id,request_key,root_session_id,owner_instance,conversation_id,alias,question,choices_json,state,inbound_id,control_revision,created_at,updated_at) VALUES('unknown','unknown','other-root','owner','recipient',2,'q','[]','UNKNOWN',NULL,?,'now','now')").run(revision)
+	seed.db.query("INSERT INTO audit(at,reason) VALUES('then','historical')").run(); seed.db.exec("DROP TABLE prompt_submissions; DROP TABLE native_requests; DROP TABLE root_runtime; DROP TABLE typing_state; DELETE FROM meta WHERE key='schema_version'; INSERT INTO meta VALUES('schema_version','5'); PRAGMA user_version=5"); seed.close()
+	const store = new Store(filename), backup = store.migrationBackupPath!; expect(backup).toContain("pre-v6"); expect(store.bindingForRoot("root")?.alias).toBe(1); expect(store.route()).toMatchObject({ conversationId: "recipient", contextToken: "context" }); expect(store.control().revision).toBe(revision); expect(store.checkpointState("active")).toBe("CANCELLED"); expect(store.checkpointState("unknown")).toBe("CANCELLED"); expect(store.pendingState("legacy")).toBe("UNKNOWN"); expect(store.state("legacy")).toBe("UNKNOWN"); expect((store.db.query("SELECT reason FROM inbound WHERE message_id='legacy'").get() as any).reason).toBe("schema-v6-semantic-change"); expect(store.db.query("SELECT 1 FROM audit WHERE reason='historical'").get()).toBeDefined()
+	const snapshot = new Database(backup); expect((snapshot.query("PRAGMA user_version").get() as any).user_version).toBe(5); expect(snapshot.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='prompt_submissions'").get()).toBeNull(); snapshot.close(); store.close(); cleanup(filename, backup)
+})
+
+test("prompt claims enforce legal conditional transitions and back uses pre-call certainty", () => {
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" })
+	expect(store.claimPromptSubmission({ submissionId: "before", inboundId: "in-before", root: "root", owner: "owner", alias: 1, messageId: "msg-before", body: "x" })?.state).toBe("SUBMITTING"); expect(store.promptSubmission("before")?.controlRevision).toBe(store.control().revision)
+	expect(store.claimPromptSubmission({ submissionId: "illegal", inboundId: "in-illegal", root: "root", owner: "owner", alias: 1, messageId: "msg-illegal", body: "x" })).toBeDefined(); expect(store.finishPromptSubmission("illegal", "SUBMITTED", "impossible")).toBe(false); expect(store.promptSubmission("illegal")?.state).toBe("SUBMITTING")
+	expect(store.claimPromptSubmission({ submissionId: "success", inboundId: "in-success", root: "root", owner: "owner", alias: 1, messageId: "msg-success", body: "x" })).toBeDefined(); expect(store.markPromptCallStarted("success")).toBe(true); expect(store.markPromptCallStarted("success")).toBe(true); expect(store.finishPromptSubmission("success", "REJECTED", "uncertain")).toBe(false); expect(store.finishPromptSubmission("success", "CANCELLED")).toBe(false); expect(store.finishPromptSubmission("success", "SUBMITTED", "sdk-message")).toBe(true); expect(store.finishPromptSubmission("success", "SUBMITTED", "sdk-message")).toBe(true); expect(store.finishPromptSubmission("success", "UNKNOWN")).toBe(false); expect(store.promptSubmission("success")).toMatchObject({ state: "SUBMITTED", promptMessageId: "sdk-message" })
+	expect(store.claimPromptSubmission({ submissionId: "during", inboundId: "in-during", root: "root", owner: "owner", alias: 1, messageId: "msg-during", body: "x" })).toBeDefined(); expect(store.markPromptCallStarted("during")).toBe(true); expect(store.claimPromptSubmission({ submissionId: "collision", inboundId: "in-during", root: "root", owner: "owner", alias: 1, messageId: "another-message", body: "x" })).toBeUndefined(); store.setControl(false); expect(store.promptSubmission("before")?.state).toBe("CANCELLED"); expect(store.promptSubmission("during")?.state).toBe("UNKNOWN"); store.close()
+})
+
+test("native requests allocate deterministic codes, never retry UNKNOWN, settle terminals and expose precedence", () => {
+	const occupied = new Set<string>(), first = allocateRequestCode("QUESTION", "same", (code) => occupied.has(code)); occupied.add(first); const second = allocateRequestCode("QUESTION", "same", (code) => occupied.has(code)); expect(first).toMatch(/^Q[A-Z2-7]{6}$/); expect(second).not.toBe(first)
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); expect(store.nativeQuery(1)).toEqual({ kind: "NONE" })
+	const one = store.openNativeRequest({ requestId: "one", requestKey: "key-one", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: { questions: [["A"]] } })!; expect(one.state).toBe("ANNOUNCING"); expect(store.finishNativeAnnouncement("one", false)).toBe(true); expect(store.nativeRequest("one")?.state).toBe("OPEN"); expect(store.nativeQuery(1).kind).toBe("ONE"); expect(store.claimNativeResolution("one", "answer")).toBe(true); expect(store.finishNativeResolution("one", "UNKNOWN")).toBe(true); expect(store.claimNativeResolution("one", "retry")).toBe(false)
+	store.openNativeRequest({ requestId: "two", requestKey: "key-two", root: "root", owner: "owner", alias: 1, kind: "PERMISSION", payload: { permission: "write" } }); expect(store.finishNativeAnnouncement("two", true)).toBe(true); expect(store.nativeQuery(1).kind).toBe("MULTIPLE"); expect(store.claimNativeResolution("two", "answer")).toBe(false); expect(store.settleNativeTerminal("one", "RESOLVED", [["A"]])).toBe(true); expect(store.nativeRequest("one")?.state).toBe("RESOLVED"); expect(store.settleNativeTerminal("one", "REJECTED")).toBe(false); expect(store.settleNativeTerminal("two", "REJECTED", "reject")).toBe(true); expect(store.nativeQuery(1).kind).toBe("NONE"); store.close()
+})
+
+test("uncertain native relay stays OPEN and resolves remotely without relay retry", () => {
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.openNativeRequest({ requestId: "uncertain-relay", requestKey: "uncertain-key", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: { question: "Choose" } }); expect(store.finishNativeAnnouncement("uncertain-relay", false)).toBe(true); expect(store.finishNativeAnnouncement("uncertain-relay", false)).toBe(true); expect(store.nativeRequest("uncertain-relay")?.state).toBe("OPEN"); expect(store.claimNativeResolution("uncertain-relay", "remote-answer")).toBe(true); expect(store.finishNativeResolution("uncertain-relay", "RESOLVED", [["yes"]])).toBe(true); expect(store.nativeRequest("uncertain-relay")?.state).toBe("RESOLVED"); store.close()
+})
+
+test("startup recovery transitions v6 uncertainty states and resets admission counts", () => {
+	const filename = tempFile("v6-recovery"), store = new Store(filename); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.refreshRoute("recipient", "ctx")
+	store.claimPromptSubmission({ submissionId: "prompt", inboundId: "in", root: "root", owner: "owner", alias: 1, messageId: "msg", body: "x" }); store.openNativeRequest({ requestId: "announce", requestKey: "announce", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.openNativeRequest({ requestId: "resolve", requestKey: "resolve", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement("resolve", true); store.claimNativeResolution("resolve", "answer"); expect(store.beginRuntimeAdmission("prompt", "root", "owner", 100, 1000)).toBe(1); store.close()
+	const recovered = new Store(filename); expect(recovered.promptSubmission("prompt")?.state).toBe("UNKNOWN"); expect(recovered.nativeRequest("announce")?.state).toBe("OPEN"); expect(recovered.nativeRequest("resolve")?.state).toBe("UNKNOWN"); expect(recovered.runtime("root")).toMatchObject({ status: "IDLE", admissionCount: 0, workPending: false }); recovered.close(); cleanup(filename)
+})
+
+test("runtime generation protects newer work, aggregates roots, honors authoritative idle and lease expiry", () => {
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "a", directory: "d", ownerInstance: "owner" }); store.bind({ rootSessionId: "b", directory: "d", ownerInstance: "owner" }); store.refreshRoute("recipient", "ctx")
+	const claim = (id: string, root: string, alias: number) => store.claimPromptSubmission({ submissionId: id, inboundId: `in-${id}`, root, owner: "owner", alias, messageId: `msg-${id}`, body: "x" })
+	claim("a1", "a", 1); const a1 = store.beginRuntimeAdmission("a1", "a", "owner", 100, 1000)!; expect(store.beginRuntimeAdmission("a1", "a", "owner", 101, 1000)).toBe(a1); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a1, 102)).toBe(false); expect(store.runtime("a")).toMatchObject({ status: "QUEUED", admissionCount: 1, workPending: true, busyGeneration: null })
+	expect(store.finishRuntimeAdmission("a1", "a", "owner")).toBe(true); expect(store.finishRuntimeAdmission("a1", "a", "owner")).toBe(true); expect(store.runtime("a")?.admissionCount).toBe(0); expect(store.observeRuntimeStatus("a", "owner", "BUSY", a1, 103)).toBe(true); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a1, 104)).toBe(true); expect(store.runtime("a")?.workPending).toBe(false)
+	claim("duplicate-one", "a", 1); const duplicateOne = store.beginRuntimeAdmission("duplicate-one", "a", "owner", 105, 1000)!; claim("duplicate-two", "a", 1); const duplicateTwo = store.beginRuntimeAdmission("duplicate-two", "a", "owner", 106, 1000)!; expect(store.runtime("a")?.admissionCount).toBe(2); expect(store.finishRuntimeAdmission("duplicate-one", "a", "owner")).toBe(true); expect(store.runtime("a")?.admissionCount).toBe(1); expect(store.finishRuntimeAdmission("duplicate-one", "a", "owner")).toBe(true); expect(store.runtime("a")?.admissionCount).toBe(1); expect(store.finishRuntimeAdmission("duplicate-two", "a", "owner")).toBe(true); expect(store.runtime("a")?.admissionCount).toBe(0); expect(store.syncRuntimeAuthoritative("a", "owner", "IDLE", duplicateTwo, 107)).toBe(true); expect(duplicateTwo).toBeGreaterThan(duplicateOne)
+	claim("a2", "a", 1); const a2 = store.beginRuntimeAdmission("a2", "a", "owner", 110, 1000)!; expect(store.finishRuntimeAdmission("a2", "a", "owner")).toBe(true); expect(store.observeRuntimeStatus("a", "owner", "BUSY", a2, 111)).toBe(true); claim("a3", "a", 1); const a3 = store.beginRuntimeAdmission("a3", "a", "owner", 112, 1000)!; expect(a3).toBeGreaterThan(a2); expect(store.finishRuntimeAdmission("a3", "a", "owner")).toBe(true); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a2, 113)).toBe(false); expect(store.runtime("a")).toMatchObject({ generation: a3, status: "BUSY", workPending: true }); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a3, 114)).toBe(false); expect(store.observeRuntimeStatus("a", "owner", "BUSY", a3, 115)).toBe(true); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a3, 116)).toBe(true)
+	claim("b1", "b", 2); const b1 = store.beginRuntimeAdmission("b1", "b", "owner", 120, 1000)!; expect(store.finishRuntimeAdmission("b1", "b", "owner")).toBe(true); expect(store.desiredTyping(121)).toBe(true); expect(store.syncRuntimeAuthoritative("b", "owner", "IDLE", b1, 122)).toBe(true); expect(store.desiredTyping(123)).toBe(false)
+	claim("lease", "a", 1); const leased = store.beginRuntimeAdmission("lease", "a", "owner", 200, 10)!; expect(store.desiredTyping(205)).toBe(true); expect(store.expireRuntimeLeases(211)).toBe(1); expect(store.runtime("a")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.observeRuntimeStatus("a", "owner", "IDLE", leased, 220)).toBe(false); store.close()
 })

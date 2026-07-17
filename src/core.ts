@@ -18,6 +18,39 @@ export const COMPLETION_ERROR_TEXT = "任务执行失败。"
 export const INSTANCE_TTL_MS = 45_000
 export const ORPHAN_PENDING_TTL_MS = 12 * 60_000
 export const OUTBOUND_ECHO_TTL_MS = 10 * 60_000
+export const REQUEST_CODE_PATTERN = /^[QP][A-Z2-7]{6}$/
+export const MAX_NATIVE_PAYLOAD_LENGTH = 64 * 1024
+
+export type PromptSubmissionState = "SUBMITTING" | "SUBMITTED" | "REJECTED" | "CANCELLED" | "UNKNOWN"
+export type NativeRequestState = "ANNOUNCING" | "OPEN" | "RESOLVING" | "RESOLVED" | "REJECTED" | "UNKNOWN" | "CANCELLED_REMOTE"
+export type NativeRequestKind = "QUESTION" | "PERMISSION"
+export type RuntimeStatus = "IDLE" | "BUSY" | "RETRY" | "QUEUED" | "UNKNOWN"
+
+export interface PromptSubmission {
+	submissionId: string; inboundId: string; rootSessionId: string; ownerInstance: string; alias: number
+	messageId: string; state: PromptSubmissionState; callStarted: boolean; promptMessageId: string | null; controlRevision: number
+	admissionGeneration: number | null; admissionFinished: boolean
+}
+export interface NativeRequest {
+	requestId: string; requestKey: string; code: string; rootSessionId: string; ownerInstance: string
+	alias: number; kind: NativeRequestKind; state: NativeRequestState; payload: unknown; inboundId: string | null; resolution: unknown; controlRevision: number
+}
+export interface RootRuntime {
+	rootSessionId: string; ownerInstance: string; status: RuntimeStatus; generation: number; busyGeneration: number | null
+	admissionCount: number; workPending: boolean; observedMs: number; leaseExpiresMs: number
+}
+
+/** Deterministic, collision-safe code allocation. The callback is intentionally injectable for tests. */
+export function allocateRequestCode(kind: NativeRequestKind, key: string, occupied: (code: string) => boolean): string {
+	const prefix = kind === "QUESTION" ? "Q" : "P", alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	for (let attempt = 0; attempt < 1_000_000; attempt++) {
+		const bytes = createHash("sha256").update(`${key}\0${attempt}`).digest()
+		let code = prefix
+		for (let index = 0; index < 6; index++) code += alphabet[bytes[index] & 31]
+		if (!occupied(code)) return code
+	}
+	throw new Error("request code space exhausted")
+}
 
 export type ParsedInbound =
 	| { ok: true; kind: "help" }
@@ -50,6 +83,27 @@ export function formatOutbound(alias: number, text: string): string {
 
 export function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex")
+}
+
+export function promptMessageIdForInbound(inboundId: string): string {
+	if (typeof inboundId !== "string" || inboundId.length < 1 || inboundId.length > 500) throw new Error("invalid inbound ID")
+	return `msg_${sha256(inboundId).slice(0, 32)}`
+}
+
+export function boundedJson(value: unknown, maxLength = MAX_NATIVE_PAYLOAD_LENGTH): string {
+	let json: string
+	try { json = JSON.stringify(value) } catch { throw new Error("invalid JSON value") }
+	if (typeof json !== "string" || json.length > maxLength) throw new Error("JSON value too large")
+	return json
+}
+
+function canonicalJson(value: unknown): string {
+	const normalize = (item: unknown): unknown => {
+		if (Array.isArray(item)) return item.map(normalize)
+		if (item && typeof item === "object") { const source = item as Record<string, unknown>, result: Record<string, unknown> = {}; for (const key of Object.keys(source).sort()) result[key] = normalize(source[key]); return result }
+		return item
+	}
+	return boundedJson(normalize(value))
 }
 
 export interface WeixinInbound {
@@ -155,16 +209,17 @@ export class Store {
 		try { snapshot = this.migrate(databasePath) } catch (error) { this.failMigration(error, snapshot) }
 		this.migrationBackupPath = snapshot
 		this.recoverCrashStates()
+		this.expireRuntimeLeases()
 		this.sweepOrphanWaiting(Date.now(), ORPHAN_PENDING_TTL_MS)
 		this.sweepOutboundEchoes()
 	}
 	private migrate(databasePath: string): string | undefined {
 		const userVersion = (this.db.query("PRAGMA user_version").get() as any)?.user_version ?? 0
-		if (userVersion > 5) throw new Error("unsupported database schema")
+		if (userVersion > 6) throw new Error("unsupported database schema")
 		const has = (table: string) => Boolean(this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table))
 		const hasLegacyData = has("bindings") || has("inbound") || has("outbound")
 		let snapshot: string | undefined
-		if (databasePath !== ":memory:" && userVersion < 5 && (userVersion > 0 || hasLegacyData)) {
+		if (databasePath !== ":memory:" && userVersion < 6 && (userVersion > 0 || hasLegacyData)) {
 			snapshot = this.createConsistentSnapshot(databasePath)
 			this.migrationSnapshotInProgress = snapshot
 			this.options.onSnapshot?.(snapshot)
@@ -210,9 +265,33 @@ CREATE TABLE IF NOT EXISTS session_activity(root_session_id TEXT PRIMARY KEY,own
 CREATE TABLE IF NOT EXISTS control_outbound(outbound_id TEXT PRIMARY KEY,dedupe_key TEXT NOT NULL UNIQUE,root_session_id TEXT NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbound_echoes(echo_hash TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL DEFAULT '',payload TEXT NOT NULL,expires_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS prompt_submissions(
+ submission_id TEXT PRIMARY KEY CHECK(length(submission_id) BETWEEN 1 AND 500),inbound_id TEXT NOT NULL UNIQUE CHECK(length(inbound_id) BETWEEN 1 AND 500),
+ root_session_id TEXT NOT NULL CHECK(length(root_session_id) BETWEEN 1 AND 500),owner_instance TEXT NOT NULL CHECK(length(owner_instance) BETWEEN 1 AND 500),alias INTEGER NOT NULL CHECK(alias>0),
+ message_id TEXT NOT NULL UNIQUE CHECK(length(message_id) BETWEEN 1 AND 500),body TEXT NOT NULL CHECK(length(body) BETWEEN 1 AND 4000),
+ state TEXT NOT NULL CHECK(state IN ('SUBMITTING','SUBMITTED','REJECTED','CANCELLED','UNKNOWN')),call_started INTEGER NOT NULL DEFAULT 0 CHECK(call_started IN (0,1)),
+ prompt_message_id TEXT,rejection TEXT,control_revision INTEGER NOT NULL,admission_generation INTEGER CHECK(admission_generation IS NULL OR admission_generation>=0),
+ admission_finished INTEGER NOT NULL DEFAULT 0 CHECK(admission_finished IN (0,1)),created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS native_requests(
+ request_id TEXT PRIMARY KEY CHECK(length(request_id) BETWEEN 1 AND 500),request_key TEXT NOT NULL UNIQUE CHECK(length(request_key) BETWEEN 1 AND 500),
+ code TEXT NOT NULL UNIQUE CHECK(code GLOB '[QP][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7]'),
+ root_session_id TEXT NOT NULL CHECK(length(root_session_id) BETWEEN 1 AND 500),owner_instance TEXT NOT NULL CHECK(length(owner_instance) BETWEEN 1 AND 500),alias INTEGER NOT NULL CHECK(alias>0),
+ kind TEXT NOT NULL CHECK(kind IN ('QUESTION','PERMISSION')),state TEXT NOT NULL CHECK(state IN ('ANNOUNCING','OPEN','RESOLVING','RESOLVED','REJECTED','UNKNOWN','CANCELLED_REMOTE')),
+ payload_json TEXT NOT NULL CHECK(length(payload_json)<=65536 AND json_valid(payload_json)),inbound_id TEXT UNIQUE,resolution_json TEXT CHECK(resolution_json IS NULL OR (length(resolution_json)<=65536 AND json_valid(resolution_json))),
+ control_revision INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS root_runtime(
+ root_session_id TEXT PRIMARY KEY CHECK(length(root_session_id) BETWEEN 1 AND 500),owner_instance TEXT NOT NULL CHECK(length(owner_instance) BETWEEN 1 AND 500),
+ status TEXT NOT NULL CHECK(status IN ('IDLE','BUSY','RETRY','QUEUED','UNKNOWN')),generation INTEGER NOT NULL DEFAULT 0 CHECK(generation>=0),busy_generation INTEGER CHECK(busy_generation IS NULL OR busy_generation>=0),
+ admission_count INTEGER NOT NULL DEFAULT 0 CHECK(admission_count>=0),work_pending INTEGER NOT NULL DEFAULT 0 CHECK(work_pending IN (0,1)),observed_ms INTEGER NOT NULL DEFAULT 0 CHECK(observed_ms>=0),lease_expires_ms INTEGER NOT NULL DEFAULT 0 CHECK(lease_expires_ms>=0),updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS typing_state(
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),desired INTEGER NOT NULL DEFAULT 0 CHECK(desired IN (0,1)),actual INTEGER CHECK(actual IS NULL OR actual IN (0,1)),
+ context_hash TEXT,attempt_ms INTEGER NOT NULL DEFAULT 0 CHECK(attempt_ms>=0),updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_pending_root_state ON pending_replies(root_session_id,state);
 CREATE INDEX IF NOT EXISTS idx_inbound_state ON inbound(state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_root_state ON prompt_submissions(root_session_id,state);
+CREATE INDEX IF NOT EXISTS idx_native_alias_state ON native_requests(alias,state);
+CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session_id,state);
 `)
 			add("pending_replies", "control_revision", "INTEGER NOT NULL DEFAULT 0")
 			add("checkpoints", "request_key", "TEXT"); add("checkpoints", "control_revision", "INTEGER NOT NULL DEFAULT 0")
@@ -222,6 +301,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 			add("outbound_echoes", "context_token", "TEXT NOT NULL DEFAULT ''"); add("outbound_echoes", "expires_ms", "INTEGER NOT NULL DEFAULT 0")
 			this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoint_request_key ON checkpoints(request_key); CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoint_active_root ON checkpoints(root_session_id) WHERE state IN ('SENDING','OPEN','ANSWERING')")
 			this.db.query("INSERT OR IGNORE INTO control_state(singleton,enabled,revision) VALUES(1,0,0)").run()
+			this.db.query("INSERT OR IGNORE INTO typing_state(singleton,desired,actual,context_hash,attempt_ms,updated_at) VALUES(1,0,NULL,NULL,0,?)").run(new Date().toISOString())
 			if (userVersion < 5 && has("bindings") && columns("bindings").has("conversation_id")) {
 				const conversations = this.db.query("SELECT DISTINCT conversation_id AS id FROM bindings WHERE conversation_id<>''").all() as Array<{ id: string }>
 				this.db.exec("ALTER TABLE bindings RENAME TO bindings_pre_v5")
@@ -244,13 +324,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 				this.db.exec("CREATE TABLE IF NOT EXISTS global_route(singleton INTEGER PRIMARY KEY CHECK(singleton=1),conversation_id TEXT,context_token TEXT,updated_at TEXT)")
 				this.db.query("INSERT OR IGNORE INTO global_route(singleton,conversation_id,context_token,updated_at) VALUES(1,NULL,NULL,NULL)").run()
 			}
-			this.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','5')").run()
-			this.db.exec("PRAGMA user_version=5")
+			if (userVersion > 0 && userVersion < 6) {
+				const now = new Date().toISOString()
+				this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now)
+				this.db.query("UPDATE inbound SET state='UNKNOWN',reason='schema-v6-semantic-change',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE state IN ('WAITING','SENDING'))").run(now)
+				this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state IN ('WAITING','SENDING')").run(now)
+				this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=?").run(now)
+			}
+			this.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','6')").run()
+			this.db.exec("PRAGMA user_version=6")
 		})()
 		return snapshot
 	}
 	private createConsistentSnapshot(databasePath: string): string {
-		const backup = `${databasePath}.pre-v5-${Date.now()}-${crypto.randomUUID()}.bak`, temp = `${backup}.tmp`
+		const label = ((this.db.query("PRAGMA user_version").get() as any)?.user_version ?? 0) < 5 ? "pre-v5-v6" : "pre-v6"
+		const backup = `${databasePath}.${label}-${Date.now()}-${crypto.randomUUID()}.bak`, temp = `${backup}.tmp`
 		const escaped = temp.replaceAll("'", "''")
 		try { this.db.exec(`VACUUM INTO '${escaped}'`); renameSync(temp, backup); return backup }
 		catch (error) { if (existsSync(temp)) try { unlinkSync(temp) } catch {}; throw new Error(`consistent pre-v5 snapshot failed: ${error instanceof Error ? error.message : String(error)}`) }
@@ -263,12 +351,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 	close(): void { this.db.close() }
 	recoverCrashStates(): void {
 		this.db.transaction(() => {
+			const now = new Date().toISOString()
 			this.db.query("UPDATE inbound SET state='UNKNOWN',reason='crash-during-injection',updated_at=? WHERE state='INJECTING'").run(new Date().toISOString())
 			this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state='WAITING' AND inbound_id IN (SELECT message_id FROM inbound WHERE state='UNKNOWN' AND reason='crash-during-injection')").run(new Date().toISOString())
 			this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state='SENDING'").run(new Date().toISOString())
 			this.db.query("UPDATE outbound SET state='UNKNOWN',updated_at=? WHERE state='SENDING'").run(new Date().toISOString())
 			this.db.query("UPDATE control_outbound SET state='UNKNOWN',updated_at=? WHERE state='SENDING'").run(new Date().toISOString())
 			this.db.query("UPDATE checkpoints SET state='UNKNOWN',updated_at=? WHERE state IN ('SENDING','ANSWERING')").run(new Date().toISOString())
+			this.db.query("UPDATE prompt_submissions SET state='UNKNOWN',updated_at=? WHERE state='SUBMITTING'").run(now)
+			this.db.query("UPDATE native_requests SET state='UNKNOWN',updated_at=? WHERE state='RESOLVING'").run(now)
+			this.db.query("UPDATE native_requests SET state='OPEN',updated_at=? WHERE state='ANNOUNCING'").run(now)
+			this.db.query("UPDATE root_runtime SET admission_count=0,updated_at=?").run(now)
+			this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=0,lease_expires_ms=0,updated_at=?").run(now)
+			this.db.query("UPDATE typing_state SET desired=0,actual=NULL,updated_at=? WHERE singleton=1").run(now)
 		})()
 	}
 	register(instanceId: string, instanceToken: string, endpoint: string): void {
@@ -301,7 +396,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 			if (existing) {
 				if (existing.ownerInstance !== input.ownerInstance && this.instance(existing.ownerInstance)?.online) throw new Error("owner-live")
 				this.db.query("UPDATE bindings SET directory=?,owner_instance=?,title=?,updated_at=? WHERE root_session_id=?").run(input.directory, input.ownerInstance, title, now, input.rootSessionId)
-				if (existing.ownerInstance !== input.ownerInstance) { this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, input.rootSessionId); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,owner_instance=?,updated_at=? WHERE root_session_id=?").run(input.ownerInstance, now, input.rootSessionId); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='owner-rebound',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, input.rootSessionId); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, input.rootSessionId) }
+				if (existing.ownerInstance !== input.ownerInstance) { this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, input.rootSessionId); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,owner_instance=?,updated_at=? WHERE root_session_id=?").run(input.ownerInstance, now, input.rootSessionId); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='owner-rebound',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, input.rootSessionId); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, input.rootSessionId); this.cancelV6Root(input.rootSessionId, input.ownerInstance, now) }
 			} else this.db.query("INSERT INTO bindings(root_session_id,directory,owner_instance,title,created_at,updated_at) VALUES(?,?,?,?,?,?)").run(input.rootSessionId, input.directory, input.ownerInstance, title, now, now)
 			this.db.query("UPDATE control_state SET enabled=1,revision=revision+1 WHERE singleton=1 AND enabled=0").run()
 			binding = this.bindingForRoot(input.rootSessionId)
@@ -331,10 +426,120 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 	setControl(enabled: boolean): { enabled: boolean; revision: number } {
 		this.db.transaction(() => {
 			this.db.query("UPDATE control_state SET enabled=?,revision=revision+1 WHERE singleton=1 AND enabled<>?").run(enabled ? 1 : 0, enabled ? 1 : 0)
-			if (!enabled) { const now = new Date().toISOString(); this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=?").run(now); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state='WAITING'").run(now); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='control-cancelled',updated_at=? WHERE state='INJECTING'").run(now) }
+			if (!enabled) { const now = new Date().toISOString(); this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=?").run(now); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state='WAITING'").run(now); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='control-cancelled',updated_at=? WHERE state='INJECTING'").run(now); this.cancelV6Root(undefined, undefined, now) }
 		})()
 		return this.control()
 	}
+	private cancelV6Root(root?: string, replacementOwner?: string, now = new Date().toISOString()): void {
+		const where = root ? " AND root_session_id=?" : "", args = root ? [now, root] : [now]
+		this.db.query(`UPDATE native_requests SET state='CANCELLED_REMOTE',updated_at=? WHERE state IN ('ANNOUNCING','OPEN','RESOLVING','UNKNOWN')${where}`).run(...args)
+		this.db.query(`UPDATE prompt_submissions SET state=CASE WHEN call_started=1 THEN 'UNKNOWN' ELSE 'CANCELLED' END,updated_at=? WHERE state='SUBMITTING'${where}`).run(...args)
+		if (root) this.db.query("INSERT INTO root_runtime(root_session_id,owner_instance,status,generation,busy_generation,admission_count,work_pending,observed_ms,lease_expires_ms,updated_at) VALUES(?,?,'IDLE',0,NULL,0,0,0,0,?) ON CONFLICT(root_session_id) DO UPDATE SET owner_instance=excluded.owner_instance,status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=0,lease_expires_ms=0,updated_at=excluded.updated_at").run(root, replacementOwner ?? this.bindingForRoot(root)?.ownerInstance ?? "cancelled", now)
+		else this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=0,lease_expires_ms=0,updated_at=?").run(now)
+		this.recomputeTypingDesired(Date.parse(now))
+	}
+	claimPromptSubmission(input: { submissionId: string; inboundId: string; root: string; owner: string; alias: number; messageId: string; body: string; revision?: number }): PromptSubmission | undefined {
+		if (![input.submissionId, input.inboundId, input.root, input.owner, input.messageId].every((value) => typeof value === "string" && value.length > 0 && value.length <= 500) || !Number.isSafeInteger(input.alias) || input.alias < 1 || !isPlainText(input.body)) throw new Error("invalid prompt submission")
+		try { const now = new Date().toISOString(); this.db.query("INSERT INTO prompt_submissions(submission_id,inbound_id,root_session_id,owner_instance,alias,message_id,body,state,call_started,prompt_message_id,rejection,control_revision,admission_generation,admission_finished,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'SUBMITTING',0,NULL,NULL,?,NULL,0,?,?)").run(input.submissionId, input.inboundId, input.root, input.owner, input.alias, input.messageId, input.body, input.revision ?? this.control().revision, now, now) } catch {
+			const existing = this.promptSubmission(input.submissionId)
+			return existing && existing.inboundId === input.inboundId && existing.rootSessionId === input.root && existing.ownerInstance === input.owner && existing.messageId === input.messageId ? existing : undefined
+		}
+		return this.promptSubmission(input.submissionId)
+	}
+	promptSubmission(id: string): PromptSubmission | undefined {
+		const row = this.db.query("SELECT submission_id AS submissionId,inbound_id AS inboundId,root_session_id AS rootSessionId,owner_instance AS ownerInstance,alias,message_id AS messageId,state,call_started AS callStarted,prompt_message_id AS promptMessageId,control_revision AS controlRevision,admission_generation AS admissionGeneration,admission_finished AS admissionFinished FROM prompt_submissions WHERE submission_id=?").get(id) as any
+		return row ? { ...row, callStarted: row.callStarted === 1, admissionFinished: row.admissionFinished === 1 } : undefined
+	}
+	markPromptCallStarted(id: string): boolean { const row = this.promptSubmission(id); if (row?.state !== "SUBMITTING") return false; if (row.callStarted) return true; return this.db.query("UPDATE prompt_submissions SET call_started=1,updated_at=? WHERE submission_id=? AND state='SUBMITTING' AND call_started=0").run(new Date().toISOString(), id).changes === 1 }
+	finishPromptSubmission(id: string, state: Exclude<PromptSubmissionState, "SUBMITTING">, detail?: string, provenNoEffect = false): boolean {
+		if (!["SUBMITTED", "REJECTED", "CANCELLED", "UNKNOWN"].includes(state)) return false
+		const existing = this.promptSubmission(id); if (!existing) return false; if (existing.state === state) return true; if (existing.state !== "SUBMITTING") return false
+		if (state === "SUBMITTED" && !existing.callStarted) return false
+		if (existing.callStarted && (state === "CANCELLED" || state === "REJECTED") && !provenNoEffect) return false
+		return this.db.query("UPDATE prompt_submissions SET state=?,prompt_message_id=CASE WHEN ?='SUBMITTED' THEN ? ELSE prompt_message_id END,rejection=CASE WHEN ?='REJECTED' THEN ? ELSE rejection END,updated_at=? WHERE submission_id=? AND state='SUBMITTING' AND call_started=?").run(state, state, detail ?? null, state, detail?.slice(0, 500) ?? null, new Date().toISOString(), id, existing.callStarted ? 1 : 0).changes === 1
+	}
+	finishInboundAdmission(inboundId: string, root: string, messageId: string): boolean { return this.db.query("UPDATE inbound SET state='INJECTED',root_session_id=?,prompt_message_id=?,reason=NULL,updated_at=? WHERE message_id=? AND state='RECEIVED'").run(root, messageId, new Date().toISOString(), inboundId).changes === 1 }
+	openNativeRequest(input: { requestId: string; requestKey: string; root: string; owner: string; alias: number; kind: NativeRequestKind; payload: unknown; revision?: number; code?: string }): NativeRequest | undefined {
+		if (![input.requestId, input.requestKey, input.root, input.owner].every((value) => typeof value === "string" && value.length > 0 && value.length <= 500) || !Number.isSafeInteger(input.alias) || input.alias < 1 || !["QUESTION", "PERMISSION"].includes(input.kind)) throw new Error("invalid native request")
+		const payload = boundedJson(input.payload), code = input.code ?? allocateRequestCode(input.kind, input.requestKey, (value) => Boolean(this.db.query("SELECT 1 FROM native_requests WHERE code=?").get(value)))
+		if (!REQUEST_CODE_PATTERN.test(code) || code[0] !== (input.kind === "QUESTION" ? "Q" : "P")) throw new Error("invalid request code")
+		try { const now = new Date().toISOString(); this.db.query("INSERT INTO native_requests(request_id,request_key,code,root_session_id,owner_instance,alias,kind,state,payload_json,inbound_id,resolution_json,control_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'ANNOUNCING',?,NULL,NULL,?,?,?)").run(input.requestId, input.requestKey, code, input.root, input.owner, input.alias, input.kind, payload, input.revision ?? this.control().revision, now, now) } catch { return }
+		return this.nativeRequest(input.requestId)
+	}
+	nativeRequest(idOrCode: string): NativeRequest | undefined {
+		const row = this.db.query("SELECT request_id AS requestId,request_key AS requestKey,code,root_session_id AS rootSessionId,owner_instance AS ownerInstance,alias,kind,state,payload_json AS payload,inbound_id AS inboundId,resolution_json AS resolution,control_revision AS controlRevision FROM native_requests WHERE request_id=? OR code=?").get(idOrCode, idOrCode) as any
+		return row ? { ...row, payload: JSON.parse(row.payload), resolution: row.resolution === null ? null : JSON.parse(row.resolution) } : undefined
+	}
+	nativeRequestForKey(requestKey: string): NativeRequest | undefined { const row = this.db.query("SELECT request_id AS id FROM native_requests WHERE request_key=?").get(requestKey) as { id: string } | null; return row ? this.nativeRequest(row.id) : undefined }
+	nativeRequestReplay(input: { requestKey: string; requestId: string; root: string; owner: string; alias: number; kind: NativeRequestKind; payload: unknown; controlRevision: number }): { result: "NONE" | "MISMATCH" } | { result: "EXACT"; request: NativeRequest } {
+		const request = this.nativeRequestForKey(input.requestKey)
+		if (!request) return { result: "NONE" }
+		const exact = request.requestId === input.requestId && request.rootSessionId === input.root && request.ownerInstance === input.owner && request.alias === input.alias && request.kind === input.kind && request.controlRevision === input.controlRevision && canonicalJson(request.payload) === canonicalJson(input.payload)
+		return exact ? { result: "EXACT", request } : { result: "MISMATCH" }
+	}
+	finishNativeAnnouncement(id: string, _delivered: boolean): boolean { const existing = this.nativeRequest(id); if (existing?.state === "OPEN") return true; return this.db.query("UPDATE native_requests SET state='OPEN',updated_at=? WHERE request_id=? AND state='ANNOUNCING'").run(new Date().toISOString(), id).changes === 1 }
+	claimNativeResolution(id: string, inboundId: string): boolean { try { return this.db.query("UPDATE native_requests SET state='RESOLVING',inbound_id=?,updated_at=? WHERE request_id=? AND state='OPEN'").run(inboundId, new Date().toISOString(), id).changes === 1 } catch { return false } }
+	releaseNativeResolution(id: string, inboundId: string): boolean { return this.db.query("UPDATE native_requests SET state='OPEN',inbound_id=NULL,updated_at=? WHERE request_id=? AND state='RESOLVING' AND inbound_id=?").run(new Date().toISOString(), id, inboundId).changes === 1 }
+	finishNativeResolution(id: string, state: "RESOLVED" | "REJECTED" | "UNKNOWN", resolution?: unknown): boolean {
+		if (!["RESOLVED", "REJECTED", "UNKNOWN"].includes(state)) return false
+		const json = resolution === undefined ? null : boundedJson(resolution)
+		return this.db.query("UPDATE native_requests SET state=?,resolution_json=?,updated_at=? WHERE request_id=? AND state='RESOLVING'").run(state, json, new Date().toISOString(), id).changes === 1
+	}
+	settleNativeTerminal(id: string, state: "RESOLVED" | "REJECTED", resolution?: unknown): boolean {
+		const json = resolution === undefined ? null : boundedJson(resolution)
+		return this.db.query("UPDATE native_requests SET state=?,resolution_json=COALESCE(?,resolution_json),updated_at=? WHERE request_id=? AND state IN ('ANNOUNCING','OPEN','RESOLVING','UNKNOWN')").run(state, json, new Date().toISOString(), id).changes === 1
+	}
+	activeNativeRequests(alias: number): NativeRequest[] { return (this.db.query("SELECT request_id AS id FROM native_requests WHERE alias=? AND state IN ('ANNOUNCING','OPEN','RESOLVING','UNKNOWN') ORDER BY created_at,request_id").all(alias) as Array<{ id: string }>).map((row) => this.nativeRequest(row.id)!) }
+	nativeQuery(alias: number): { kind: "NONE" } | { kind: "ONE"; request: NativeRequest } | { kind: "MULTIPLE"; requests: NativeRequest[] } { const requests = this.activeNativeRequests(alias); return requests.length === 0 ? { kind: "NONE" } : requests.length === 1 ? { kind: "ONE", request: requests[0] } : { kind: "MULTIPLE", requests } }
+	beginRuntimeAdmission(submissionId: string, root: string, owner: string, now = Date.now(), leaseMs = INSTANCE_TTL_MS): number | undefined {
+		return this.db.transaction(() => {
+			const submission = this.promptSubmission(submissionId)
+			if (!submission || submission.rootSessionId !== root || submission.ownerInstance !== owner) return
+			if (submission.admissionGeneration !== null) return submission.admissionGeneration
+			if (submission.state !== "SUBMITTING") return
+			const iso = new Date(now).toISOString()
+			this.db.query("INSERT INTO root_runtime(root_session_id,owner_instance,status,generation,busy_generation,admission_count,work_pending,observed_ms,lease_expires_ms,updated_at) VALUES(?,?,'QUEUED',1,NULL,1,1,?,?,?) ON CONFLICT(root_session_id) DO UPDATE SET owner_instance=excluded.owner_instance,status=CASE WHEN status IN ('BUSY','RETRY') THEN status ELSE 'QUEUED' END,generation=generation+1,admission_count=admission_count+1,work_pending=1,observed_ms=excluded.observed_ms,lease_expires_ms=excluded.lease_expires_ms,updated_at=excluded.updated_at").run(root, owner, now, now + leaseMs, iso)
+			const generation = this.runtime(root)!.generation
+			const claimed = this.db.query("UPDATE prompt_submissions SET admission_generation=?,updated_at=? WHERE submission_id=? AND admission_generation IS NULL AND admission_finished=0").run(generation, iso, submissionId)
+			if (claimed.changes !== 1) throw new Error("runtime admission claim race")
+			return generation
+		})()
+	}
+	finishRuntimeAdmission(submissionId: string, root: string, owner: string): boolean {
+		return this.db.transaction(() => {
+			const submission = this.promptSubmission(submissionId)
+			if (!submission || submission.rootSessionId !== root || submission.ownerInstance !== owner || submission.admissionGeneration === null) return false
+			if (submission.admissionFinished) return true
+			const now = new Date().toISOString(), finished = this.db.query("UPDATE prompt_submissions SET admission_finished=1,updated_at=? WHERE submission_id=? AND admission_generation=? AND admission_finished=0").run(now, submissionId, submission.admissionGeneration)
+			if (finished.changes !== 1) return false
+			this.db.query("UPDATE root_runtime SET admission_count=admission_count-1,updated_at=? WHERE root_session_id=? AND owner_instance=? AND admission_count>0").run(now, root, owner)
+			return true
+		})()
+	}
+	observeRuntimeStatus(root: string, owner: string, status: "BUSY" | "RETRY" | "QUEUED" | "IDLE", generation: number, now = Date.now(), leaseMs = INSTANCE_TTL_MS): boolean {
+		if (status === "IDLE") return this.db.query("UPDATE root_runtime SET status='IDLE',busy_generation=NULL,work_pending=0,observed_ms=?,lease_expires_ms=?,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=? AND status IN ('BUSY','RETRY') AND busy_generation=? AND admission_count=0").run(now, now + leaseMs, new Date(now).toISOString(), root, owner, generation, generation).changes === 1
+		if (status === "QUEUED") return this.db.query("UPDATE root_runtime SET status='QUEUED',work_pending=1,observed_ms=?,lease_expires_ms=?,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=?").run(now, now + leaseMs, new Date(now).toISOString(), root, owner, generation).changes === 1
+		return this.db.query("UPDATE root_runtime SET status=?,busy_generation=?,work_pending=1,observed_ms=?,lease_expires_ms=?,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=?").run(status, generation, now, now + leaseMs, new Date(now).toISOString(), root, owner, generation).changes === 1
+	}
+	syncRuntimeAuthoritative(root: string, owner: string, status: "BUSY" | "RETRY" | "QUEUED" | "IDLE", generation: number, now = Date.now(), leaseMs = INSTANCE_TTL_MS): boolean {
+		if (status !== "IDLE") return this.observeRuntimeStatus(root, owner, status, generation, now, leaseMs)
+		return this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=?,lease_expires_ms=?,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=?").run(now, now + leaseMs, new Date(now).toISOString(), root, owner, generation).changes === 1
+	}
+	reconcileRuntimeAuthoritative(root: string, owner: string, status: "BUSY" | "RETRY" | "IDLE", now = Date.now(), leaseMs = INSTANCE_TTL_MS): number {
+		const current = this.runtime(root), generation = current?.generation ?? 1, iso = new Date(now).toISOString()
+		if (!current) this.db.query("INSERT INTO root_runtime(root_session_id,owner_instance,status,generation,busy_generation,admission_count,work_pending,observed_ms,lease_expires_ms,updated_at) VALUES(?,?,?,?,?,0,?,?,?,?)").run(root, owner, status, generation, status === "IDLE" ? null : generation, status === "IDLE" ? 0 : 1, now, now + leaseMs, iso)
+		else this.syncRuntimeAuthoritative(root, owner, status, generation, now, leaseMs)
+		return generation
+	}
+	runtime(root: string): RootRuntime | undefined { const row = this.db.query("SELECT root_session_id AS rootSessionId,owner_instance AS ownerInstance,status,generation,busy_generation AS busyGeneration,admission_count AS admissionCount,work_pending AS workPending,observed_ms AS observedMs,lease_expires_ms AS leaseExpiresMs FROM root_runtime WHERE root_session_id=?").get(root) as any; return row ? { ...row, workPending: row.workPending === 1 } : undefined }
+	expireRuntimeLeases(now = Date.now()): number { return this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,lease_expires_ms=0,updated_at=? WHERE work_pending=1 AND lease_expires_ms>0 AND lease_expires_ms<=?").run(new Date(now).toISOString(), now).changes }
+	desiredTyping(now = Date.now()): boolean {
+		this.expireRuntimeLeases(now); return this.recomputeTypingDesired(now)
+	}
+	private recomputeTypingDesired(now = Date.now()): boolean { const control = this.control(), route = this.route(); const desired = Boolean(control.enabled && route.conversationId && route.contextToken && this.db.query("SELECT 1 FROM root_runtime WHERE work_pending=1 AND status IN ('BUSY','RETRY','QUEUED') AND lease_expires_ms>?").get(now)); this.db.query("UPDATE typing_state SET desired=?,updated_at=? WHERE singleton=1").run(desired ? 1 : 0, new Date(now).toISOString()); return desired }
+	typingDesired(): boolean { return (this.db.query("SELECT desired FROM typing_state WHERE singleton=1").get() as { desired: number }).desired === 1 }
+	typingState(): { desired: boolean; actual: boolean | null; contextHash: string | null; attemptMs: number } { const row = this.db.query("SELECT desired,actual,context_hash AS contextHash,attempt_ms AS attemptMs FROM typing_state WHERE singleton=1").get() as any; return { desired: row.desired === 1, actual: row.actual === null ? null : row.actual === 1, contextHash: row.contextHash, attemptMs: row.attemptMs } }
+	setTypingActual(actual: boolean | null, contextHash: string | null, now = Date.now()): void { if (contextHash !== null && contextHash.length > 500) throw new Error("invalid typing context hash"); this.db.query("UPDATE typing_state SET actual=?,context_hash=?,attempt_ms=?,updated_at=? WHERE singleton=1").run(actual === null ? null : actual ? 1 : 0, contextHash, now, new Date(now).toISOString()) }
 	checkpointForRequest(requestKey: string, root?: string): { checkpointId: string; state: string; rootSessionId: string; ownerInstance: string } | undefined { const row = this.db.query("SELECT checkpoint_id AS checkpointId,state,root_session_id AS rootSessionId,owner_instance AS ownerInstance FROM checkpoints WHERE request_key=?").get(requestKey) as { checkpointId: string; state: string; rootSessionId: string; ownerInstance: string } | null; return row && (!root || row.rootSessionId === root) ? row : undefined }
 	openCheckpoint(input: { checkpointId: string; requestKey: string; root: string; owner: string; alias: number; question: string; choices: string[]; revision: number }): boolean {
 		const control = this.control(); if (!control.enabled || control.revision !== input.revision || this.bindingForRoot(input.root)?.ownerInstance !== input.owner) return false
@@ -387,6 +592,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_inbound ON outbound(inbound_id);
 	}
 	claimSystemOutbound(message: WeixinInbound, kind: string, payload: string): { outboundId: string } | undefined { const outboundId = crypto.randomUUID(); try { this.db.query("INSERT INTO control_outbound VALUES(?,?,?,?,'SENDING',?,?,?,?)").run(outboundId, `inbound:${message.id}:${kind}`, `inbound:${message.id}`, kind, payload, message.fromUserId, message.contextToken, new Date().toISOString()); return { outboundId } } catch { return } }
 	controlOutboundState(dedupeKey: string): string | undefined { return (this.db.query("SELECT state FROM control_outbound WHERE dedupe_key=?").get(dedupeKey) as { state: string } | null)?.state }
+	controlOutboundPayload(dedupeKey: string): string | undefined { return (this.db.query("SELECT payload FROM control_outbound WHERE dedupe_key=?").get(dedupeKey) as { payload: string } | null)?.payload }
 	finishControlOutbound(outboundId: string, sent: boolean): void { this.db.query("UPDATE control_outbound SET state=?,updated_at=? WHERE outbound_id=? AND state='SENDING'").run(sent ? "SENT" : "UNKNOWN", new Date().toISOString(), outboundId) }
 	recordEcho(conversationId: string, contextToken: string, payload: string, now = Date.now(), ttlMs = OUTBOUND_ECHO_TTL_MS): void { this.db.query("INSERT OR REPLACE INTO outbound_echoes(echo_hash,conversation_id,context_token,payload,expires_ms,created_at) VALUES(?,?,?,?,?,?)").run(sha256(`${conversationId}\0${contextToken}\0${payload}`), conversationId, contextToken, payload, now + ttlMs, new Date(now).toISOString()) }
 	matchesEcho(conversationId: string, contextToken: string, payload: string, now = Date.now()): boolean { this.sweepOutboundEchoes(now); return Boolean(this.db.query("SELECT 1 FROM outbound_echoes WHERE echo_hash=? AND conversation_id=? AND context_token=? AND payload=? AND expires_ms>?").get(sha256(`${conversationId}\0${contextToken}\0${payload}`), conversationId, contextToken, payload, now)) }

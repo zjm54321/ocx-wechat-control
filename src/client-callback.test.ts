@@ -1,0 +1,71 @@
+import { expect, test } from "bun:test"
+import { createCallbackHandler } from "./client"
+import type { ControlResult, V2ControlClient } from "./control-client"
+
+const ok = (data: unknown, status = 200): ControlResult => ({ data, error: undefined, status })
+const legacy = { session: { get: async () => ({ data: { id: "root" } }), prompt: async () => ({}) } }
+
+class FakeControlClient implements V2ControlClient {
+	readonly sessions = new Map<string, { id: string; parentID?: string }>([["root", { id: "root" }], ["child", { id: "child", parentID: "root" }]])
+	readonly prompts: Array<{ sessionID: string; directory: string; messageID: string; parts: Array<{ type: "text"; text: string }> }> = []
+	readonly questionReplies: Array<{ requestID: string; directory: string; answers: string[][] }> = []
+	readonly permissionReplies: Array<{ requestID: string; directory: string; reply: "once" | "reject" }> = []
+	questionRequests: unknown = [{ id: "question", sessionID: "child" }]
+	permissionRequests: unknown = [{ id: "permission", sessionID: "child" }]
+	statuses: unknown = { root: { type: "busy" } }
+	promptResult = ok(undefined, 204)
+	async sessionGet(input: { sessionID: string; directory: string }): Promise<ControlResult> { const value = this.sessions.get(input.sessionID); return value ? ok(value) : { data: undefined, error: { name: "not-found" }, status: 404 } }
+	async sessionPromptAsync(input: { sessionID: string; directory: string; messageID: string; parts: Array<{ type: "text"; text: string }> }): Promise<ControlResult> { this.prompts.push(input); return this.promptResult }
+	async sessionStatus(_input: { directory: string }): Promise<ControlResult> { return ok(this.statuses) }
+	async questionList(_input: { directory: string }): Promise<ControlResult> { return ok(this.questionRequests) }
+	async questionReply(input: { requestID: string; directory: string; answers: string[][] }): Promise<ControlResult> { this.questionReplies.push(input); return ok(true) }
+	async permissionList(_input: { directory: string }): Promise<ControlResult> { return ok(this.permissionRequests) }
+	async permissionReply(input: { requestID: string; directory: string; reply: "once" | "reject" }): Promise<ControlResult> { this.permissionReplies.push(input); return ok(true) }
+}
+
+function request(path: string, body: unknown, headers: Record<string, string> = {}): Request {
+	return new Request(`http://127.0.0.1${path}`, { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret", "x-wechat-instance-token": "token", ...headers }, body: JSON.stringify(body) })
+}
+
+function handler(client: V2ControlClient): (request: Request) => Promise<Response> { return createCallbackHandler(legacy, "secret", "token", client) }
+
+test("submit-prompt admits exact stable message asynchronously with explicit 204", async () => {
+	const client = new FakeControlClient(), response = await handler(client)(request("/submit-prompt", { rootSessionId: "root", directory: "C:/work", inboundId: "inbound-stable", messageId: "msg_stable", text: "do work" }))
+	expect(response.status).toBe(200); expect(await response.json()).toEqual({ ok: true, accepted: true }); expect(client.prompts).toEqual([{ sessionID: "root", directory: "C:/work", messageID: "msg_stable", parts: [{ type: "text", text: "do work" }] }])
+})
+
+test("submit-prompt rejects non-root before call and maps post-call ambiguity to UNKNOWN", async () => {
+	const client = new FakeControlClient(), run = handler(client)
+	const child = await run(request("/submit-prompt", { rootSessionId: "child", directory: "d", inboundId: "in", messageId: "msg", text: "x" })); expect(child.status).toBe(409); expect(await child.json()).toMatchObject({ certainty: "REJECTED", error: "not-root" }); expect(client.prompts).toHaveLength(0)
+	client.promptResult = { data: undefined, error: { name: "transport" }, status: 0 }; const uncertain = await run(request("/submit-prompt", { rootSessionId: "root", directory: "d", inboundId: "in", messageId: "msg", text: "x" })); expect(uncertain.status).toBe(409); expect(await uncertain.json()).toMatchObject({ certainty: "UNKNOWN" }); expect(client.prompts).toHaveLength(1)
+})
+
+test("question resolution validates child ancestry and preserves ordered string answers", async () => {
+	const client = new FakeControlClient(), response = await handler(client)(request("/resolve-question", { rootSessionId: "root", sourceSessionId: "child", requestId: "question", directory: "d", answers: [["B", "A"], ["custom"]] }))
+	expect(response.status).toBe(200); expect(client.questionReplies).toEqual([{ requestID: "question", directory: "d", answers: [["B", "A"], ["custom"]] }]); expect(client.prompts).toHaveLength(0)
+	client.sessions.set("other", { id: "other" }); client.sessions.set("foreign", { id: "foreign", parentID: "other" }); client.questionRequests = [{ id: "foreign-question", sessionID: "foreign" }]
+	const rejected = await handler(client)(request("/resolve-question", { rootSessionId: "root", sourceSessionId: "foreign", requestId: "foreign-question", directory: "d", answers: [["A"]] })); expect(rejected.status).toBe(409); expect(client.questionReplies).toHaveLength(1)
+})
+
+test("permission accepts only once or reject and never forwards always or invalid input", async () => {
+	const client = new FakeControlClient(), run = handler(client), base = { rootSessionId: "root", sourceSessionId: "child", requestId: "permission", directory: "d" }
+	for (const decision of ["once", "reject"] as const) { const response = await run(request("/resolve-permission", { ...base, decision })); expect(response.status).toBe(200) }
+	expect(client.permissionReplies.map((item) => item.reply)).toEqual(["once", "reject"])
+	for (const decision of ["always", "allow", true, null]) { const response = await run(request("/resolve-permission", { ...base, decision })); expect(response.status).toBe(400) }
+	expect(client.permissionReplies).toHaveLength(2)
+})
+
+test("callbacks reject malformed, oversized, unavailable requests and authentication failures", async () => {
+	const client = new FakeControlClient(), run = handler(client)
+	const malformed = await run(request("/resolve-question", { rootSessionId: "root", sourceSessionId: "child", requestId: "question", directory: "d", answers: "A" })); expect(malformed.status).toBe(400)
+	const oversized = await run(request("/submit-prompt", { rootSessionId: "root", directory: "d", inboundId: "in", messageId: "msg", text: "x".repeat(130_000) })); expect(oversized.status).toBe(400)
+	client.questionRequests = []; const unavailable = await run(request("/resolve-question", { rootSessionId: "root", sourceSessionId: "child", requestId: "question", directory: "d", answers: [["A"]] })); expect(unavailable.status).toBe(409); expect(client.questionReplies).toHaveLength(0)
+	const badSecret = await run(request("/runtime-status", { rootSessionId: "root", rootSessionIds: ["root"], directory: "d" }, { "x-wechat-control-key": "bad" })); expect(badSecret.status).toBe(401)
+	const badToken = await run(request("/runtime-status", { rootSessionId: "root", rootSessionIds: ["root"], directory: "d" }, { "x-wechat-instance-token": "bad" })); expect(badToken.status).toBe(401)
+})
+
+test("runtime-status validates exact roots and normalizes authoritative statuses", async () => {
+	const client = new FakeControlClient(); client.sessions.set("idle", { id: "idle" }); client.sessions.set("retry", { id: "retry" }); client.statuses = { root: { type: "busy" }, retry: { type: "retry", attempt: 1 }, extra: { type: "busy" } }
+	const response = await handler(client)(request("/runtime-status", { rootSessionId: "root", rootSessionIds: ["root", "idle", "retry"], directory: "d" })); expect(response.status).toBe(200); expect(await response.json()).toEqual({ ok: true, statuses: [{ rootSessionId: "root", status: "BUSY" }, { rootSessionId: "idle", status: "IDLE" }, { rootSessionId: "retry", status: "RETRY" }] })
+	const child = await handler(client)(request("/runtime-status", { rootSessionId: "root", rootSessionIds: ["child"], directory: "d" })); expect(child.status).toBe(409)
+})

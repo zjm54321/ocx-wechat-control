@@ -38,6 +38,8 @@ export interface McpClient {
 	close(): void
 }
 
+function spawnMcp(command: string[]) { return Bun.spawn(command, { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true } as const) }
+
 type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: Timer }
 
 export class JsonRpcPendingMap {
@@ -61,12 +63,12 @@ export class JsonRpcPendingMap {
 }
 
 export class JsonRpcStdioClient implements McpClient {
-	private readonly process: ReturnType<typeof Bun.spawn>
+	private readonly process: ReturnType<typeof spawnMcp>
 	private readonly rpc = new JsonRpcPendingMap()
 	private closed = false
 	constructor(command: string[]) {
 		if (!command.length) throw new Error("empty MCP command")
-		this.process = Bun.spawn(command, { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true })
+		this.process = spawnMcp(command)
 		void this.readStdout()
 		// stderr can contain account paths, tokens or QR material. Drain and discard it.
 		void new Response(this.process.stderr).arrayBuffer().catch(() => {})

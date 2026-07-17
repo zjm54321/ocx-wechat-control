@@ -4,6 +4,7 @@ import { WeixinMcpAdapter, type WeChatAdapter } from "./adapter"
 import { BrokerService } from "./broker"
 import { Store, initializeState } from "./core"
 import { acquireWorkerLock, type LockMetadata } from "./worker-runtime"
+import { TypingCoordinator } from "./typing"
 
 export interface WorkerConfig { enabled: true; weixinCommand: string[] }
 export interface WorkerDependencies {
@@ -11,7 +12,8 @@ export interface WorkerDependencies {
 	acquireLock: typeof acquireWorkerLock
 	createStore(databasePath: string): Store
 	createAdapter(config: WorkerConfig): WeChatAdapter
-	createBroker(store: Store, adapter: WeChatAdapter, secret: string, token: string): BrokerService
+	createBroker(store: Store, adapter: WeChatAdapter, secret: string, token: string, typing?: TypingCoordinator): BrokerService
+	createTyping?(store: Store): TypingCoordinator
 	waitForShutdown(): Promise<void>
 }
 
@@ -28,7 +30,8 @@ export async function runWorker(config: WorkerConfig, overrides: Partial<WorkerD
 		acquireLock: acquireWorkerLock,
 		createStore: (databasePath) => new Store(databasePath),
 		createAdapter: (value) => new WeixinMcpAdapter({ enabled: value.enabled, command: value.weixinCommand }),
-		createBroker: (store, adapter, secret, token) => new BrokerService(store, adapter, secret, token),
+		createTyping: (store) => new TypingCoordinator(store),
+		createBroker: (store, adapter, secret, token, typing) => new BrokerService(store, adapter, secret, token, fetch, { typing }),
 		waitForShutdown: () => new Promise<void>((resolve) => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); process.once("beforeExit", resolve) }),
 	}
 	const deps = { ...defaults, ...overrides }
@@ -38,19 +41,24 @@ export async function runWorker(config: WorkerConfig, overrides: Partial<WorkerD
 	let store: Store | undefined
 	let adapter: WeChatAdapter | undefined
 	let broker: BrokerService | undefined
+	let typing: TypingCoordinator | undefined
 	let heartbeat: Timer | undefined
 	try {
 		lock = await deps.acquireLock(state.directory, state.secret, initial)
 		store = deps.createStore(path.join(state.directory, "state.sqlite"))
 		adapter = deps.createAdapter(config)
-		broker = deps.createBroker(store, adapter, state.secret, workerToken)
+		typing = deps.createTyping?.(store)
+		broker = deps.createBroker(store, adapter, state.secret, workerToken, typing)
 		const endpoint = broker.start()
-		const update = () => { store?.sweepOrphanWaiting(); store?.sweepOutboundEchoes(); return lock!.update({ ...initial, endpoint, heartbeat: new Date().toISOString() }).catch(() => {}) }
-		await update(); heartbeat = setInterval(update, 15_000)
+		await lock.update({ ...initial, endpoint, heartbeat: new Date().toISOString() })
 		await broker.startAdapter()
+		if (typing) await typing.startup()
+		const update = () => { store?.sweepOrphanWaiting(); store?.sweepOutboundEchoes(); store?.expireRuntimeLeases(); typing?.refresh(); return lock!.update({ ...initial, endpoint, heartbeat: new Date().toISOString() }).catch(() => {}) }
+		await update(); heartbeat = setInterval(update, 15_000)
 		await deps.waitForShutdown()
 	} finally {
 		if (heartbeat) clearInterval(heartbeat)
+		try { await typing?.shutdown() } catch {}
 		try { if (broker) broker.stop(); else adapter?.stop() } catch {}
 		try { store?.close() } catch {}
 		await lock?.release().catch(() => {})

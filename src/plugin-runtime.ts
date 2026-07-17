@@ -1,5 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { ClientLifecycleRegistry, connectOrStartWorker, requestInputRpc, resolveRootSession, rpc, startCallbackServer, type ClientLifecycle } from "./client"
+import { ClientLifecycleRegistry, connectOrStartWorker, resolveRootSession, rpc, startV2CallbackServer, type CallbackServer, type ClientLifecycle } from "./client"
 import { sanitizeTitle, SerialQueue, sha256 } from "./core"
 import { createRequire } from "node:module"
 
@@ -15,6 +15,8 @@ let exitHandlersInstalled = false
 async function stopAll(): Promise<void> { await registry.stopAll() }
 function installExitHandlers(): void { if (exitHandlersInstalled) return; exitHandlersInstalled = true; process.once("beforeExit", () => { void stopAll() }); process.once("SIGINT", () => { void stopAll() }); process.once("SIGTERM", () => { void stopAll() }) }
 export function lifecycleRegistrySize(): number { return registry.size() }
+
+export function startPluginCallbackServer(client: Parameters<typeof startV2CallbackServer>[0], serverUrl: URL, directory: string, sharedSecret: string, instanceToken: string): CallbackServer { return startV2CallbackServer(client, serverUrl, directory, sharedSecret, instanceToken) }
 
 export class ControlCommandHandled extends Error { constructor(message: string) { super(message); this.name = "WechatControlCommandHandled" } }
 
@@ -51,29 +53,39 @@ export function createControlCommandHook(rpcCall: typeof rpc, toast: (enabled: b
 export function createPermissionHook(resolveRoot: (sessionId: string) => Promise<string>, rpcCall: typeof rpc, endpoint: string, secret: string, instanceId: string, instanceToken: string) {
 	return async (input: { sessionID: string; id: string }, output: { status: "ask" | "deny" | "allow" }) => {
 		output.status = "ask"
-		try {
-			const rootSessionId = await resolveRoot(input.sessionID), status = await rpcCall(endpoint, secret, { method: "control-get", instanceId, instanceToken, rootSessionId }, 1500)
-			if (!status.enabled || !status.routable) return
-			output.status = "deny"
-			void rpcCall(endpoint, secret, { method: "permission-denied-notice", instanceId, instanceToken, rootSessionId, permissionId: input.id }, 1500).catch(() => {})
-		} catch { output.status = "ask" }
+		try { await resolveRoot(input.sessionID) } catch { /* retain native ask on validation failure */ }
 	}
 }
 
-export function createControlEventHook(rpcCall: typeof rpc, endpoint: string, secret: string, instanceId: string, instanceToken: string) {
+function validEventText(value: unknown, max = 4000): value is string { return typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value) }
+function nativeEvent(value: unknown): Record<string, unknown> | undefined { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined }
+
+export function createControlEventHook(rpcCall: typeof rpc, endpoint: string, secret: string, instanceId: string, instanceToken: string, resolveRoot: (sessionId: string) => Promise<string> = async (sessionId) => sessionId) {
 	const queue = new SerialQueue(), auth = { instanceId, instanceToken }
 	return async ({ event }: any) => {
-		const sessionID = event.type === "message.updated" ? event.properties?.info?.sessionID : event.properties?.sessionID
+		const properties = nativeEvent(event?.properties), info = nativeEvent(properties?.info), sessionID = typeof (event.type === "message.updated" ? info?.sessionID : properties?.sessionID) === "string" ? (event.type === "message.updated" ? info?.sessionID : properties?.sessionID) as string : undefined
 		if (typeof sessionID !== "string") return
 		return queue.run(sessionID, async () => {
 			try {
-				if (event.type === "message.updated") { const info = event.properties?.info; if (info?.role !== "assistant" || info.summary || (!info.time?.completed && !info.finish && !info.error)) return; await rpcCall(endpoint, secret, { method: "observe-assistant", ...auth, rootSessionId: sessionID, assistantMessageId: info.id, failed: Boolean(info.error) }) }
-				else if (event.type === "session.status") { const status = event.properties?.status?.type; if (status !== "busy" && status !== "idle") return; await rpcCall(endpoint, secret, { method: "observe-status", ...auth, rootSessionId: sessionID, status }) }
-				else if (event.type === "session.idle") await rpcCall(endpoint, secret, { method: "observe-status", ...auth, rootSessionId: sessionID, status: "idle" })
+				const rootSessionId = await resolveRoot(sessionID)
+				if (event.type === "message.updated") { if (info?.role !== "assistant" || info.summary || (!nativeEvent(info.time)?.completed && !info.finish && !info.error) || !validEventText(info.id as unknown, 500)) return; await rpcCall(endpoint, secret, { method: "observe-assistant", ...auth, rootSessionId, assistantMessageId: info.id, failed: Boolean(info.error) }) }
+				else if (event.type === "session.status") { const status = event.properties?.status?.type; if (status !== "busy" && status !== "retry" && status !== "idle") return; await rpcCall(endpoint, secret, { method: "observe-status", ...auth, rootSessionId, status }) }
+				else if (event.type === "session.idle") await rpcCall(endpoint, secret, { method: "observe-status", ...auth, rootSessionId, status: "idle" })
+				else if (event.type === "question.asked" || event.type === "permission.asked") {
+					const id = properties?.id, requestKey = `${event.type}:${id}`, payload = event.type === "question.asked" ? { sourceSessionId: sessionID, questions: properties?.questions } : { sourceSessionId: sessionID, permission: properties?.permission }
+					if (!validEventText(id, 500) || (event.type === "question.asked" && !Array.isArray(properties?.questions)) || (event.type === "permission.asked" && !validEventText(properties?.permission, 500))) return
+					await rpcCall(endpoint, secret, { method: "native-request-open", ...auth, rootSessionId, requestId: id, requestKey, kind: event.type === "question.asked" ? "QUESTION" : "PERMISSION", payload })
+				} else if (event.type === "question.replied" || event.type === "question.rejected" || event.type === "permission.replied" || event.type === "permission.rejected") {
+					const id = properties?.requestID ?? properties?.id, terminal = event.type.endsWith("rejected") ? "REJECTED" : "RESOLVED"
+					if (!validEventText(id, 500)) return
+					await rpcCall(endpoint, secret, { method: "native-request-terminal", ...auth, rootSessionId, requestId: id, state: terminal, resolution: properties?.answers ?? properties?.reply })
+				}
 			} catch {}
 		})
 	}
 }
+
+export function createPluginEventHook(resolveRoot: (sessionId: string) => Promise<string>, rpcCall: typeof rpc, endpoint: string, secret: string, instanceId: string, instanceToken: string) { return createControlEventHook(rpcCall, endpoint, secret, instanceId, instanceToken, resolveRoot) }
 
 export async function requestInputToolOutcome(action: () => Promise<any>): Promise<string> {
 	try { const result = await action(); if (result.unknown || result.state === "UNKNOWN") return "检查点发送结果未知。禁止重复发送；请立即结束本回合。" }
@@ -81,18 +93,18 @@ export async function requestInputToolOutcome(action: () => Promise<any>): Promi
 	return "检查点已异步发送。不要等待或猜测微信答案；请立即结束本回合。答案将作为一个新的用户 turn 注入。"
 }
 
-export function captureRequestInputCallID(input: any, output: any): void { if (input.tool === "wechat_request_input" && typeof input.callID === "string" && output.args && typeof output.args === "object") output.args.__wechatRequestKey = input.callID }
+export function captureReplyCallID(input: any, output: any): void { if (input.tool === "wechat_reply" && typeof input.callID === "string" && output.args && typeof output.args === "object") output.args.__wechatCallID = input.callID }
 export function requestInputRequestKey(args: any, context: any): string { return String(context.callID ?? args.__wechatRequestKey ?? `fallback:${context.messageID}:${sha256(JSON.stringify([args.question, args.choices ?? []]))}`) }
 export function executeRequestInputTool(args: any, context: any, action: (requestKey: string) => Promise<any>): Promise<string> { const requestKey = requestInputRequestKey(args, context); return requestInputToolOutcome(() => action(requestKey)) }
 
-export const WeChatControlPlugin: Plugin = async ({ client, directory }, options) => {
+export const WeChatControlPlugin: Plugin = async ({ client, directory, serverUrl }, options) => {
 	const config = (options ?? {}) as { enabled?: unknown; weixinCommand?: unknown }
 	if (config.enabled !== true) throw new Error("wechat-control requires enabled:true")
 	const weixinCommand = resolveWeixinCommand(config.weixinCommand)
 	installExitHandlers(); await registry.stop(directory)
 	const state = await (await import("./core")).initializeState()
 	const instanceId = crypto.randomUUID(), instanceToken = crypto.randomUUID()
-	const callback = startCallbackServer(client, state.secret, instanceToken)
+	const callback = startPluginCallbackServer(client, serverUrl, directory, state.secret, instanceToken)
 	let worker: { endpoint: string; secret: string; adapter: string }
 	try { worker = await connectOrStartWorker({ enabled: true, weixinCommand }); await rpc(worker.endpoint, worker.secret, { method: "register", instanceId, instanceToken, endpoint: callback.endpoint }) }
 	catch (error) { callback.stop(); throw error }
@@ -104,22 +116,20 @@ export const WeChatControlPlugin: Plugin = async ({ client, directory }, options
 	const root = (sessionID: string) => resolveRootSession(client, sessionID)
 	const commandHook = createControlCommandHook(rpc, async (enabled, alias) => { await client.tui.showToast({ query: { directory }, body: { title: "WeChat Control", message: enabled ? `已登记 #${alias}，微信输入 id 可查看会话` : "受限微信接管已关闭", variant: enabled ? "success" : "info" } }) }, worker.endpoint, worker.secret, instanceId, instanceToken, (sessionID) => client.session.get({ path: { id: sessionID } }), directory)
 	const permissionHook = createPermissionHook(root, rpc, worker.endpoint, worker.secret, instanceId, instanceToken)
-	const eventHook = createControlEventHook(rpc, worker.endpoint, worker.secret, instanceId, instanceToken)
+	const eventHook = createPluginEventHook(root, rpc, worker.endpoint, worker.secret, instanceId, instanceToken)
 
 	return {
 		config: async (value: any) => { registerControlCommands(value) },
 		"command.execute.before": commandHook,
-		"tool.execute.before": async (input: any, output: any) => { captureRequestInputCallID(input, output) },
+		"tool.execute.before": async (input: any, output: any) => { captureReplyCallID(input, output) },
 		tool: {
-			wechat_request_input: tool({ description: "Asynchronously send one restricted takeover checkpoint to the bound WeChat conversation. The answer arrives as a later, new turn; call once and then end this turn.", args: { question: tool.schema.string().min(1).max(1500), choices: tool.schema.array(tool.schema.string().min(1).max(120)).max(8).optional() }, async execute(args, context) {
-				return executeRequestInputTool(args, context, async (requestKey) => { const rootSessionId = await root(context.sessionID); return requestInputRpc(worker.endpoint, worker.secret, { method: "request-input", ...auth, rootSessionId, requestKey, question: args.question, choices: args.choices ?? [] }) })
-			} }),
+			wechat_reply: tool({ description: "Send text to the bound WeChat conversation. The call is durably deduplicated by tool call ID and never retries an unknown send.", args: { text: tool.schema.string().min(1).max(4000), __wechatCallID: tool.schema.string().max(500).optional() }, async execute(args, context) { const rootSessionId = await root(context.sessionID), callId = args.__wechatCallID ?? context.messageID; const result = await rpc(worker.endpoint, worker.secret, { method: "wechat-reply", ...auth, rootSessionId, callId, text: args.text }); return result.state === "UNKNOWN" ? "微信回复发送结果未知；禁止重复发送。" : result.ok ? "已发送。" : "微信回复未发送。" } }),
 			wechat_send_text: tool({ description: "Restricted compatibility tool; arbitrary/manual sends are disabled.", args: { text: tool.schema.string().min(1).max(4000) }, async execute() { return "拒绝：仅允许受限接管状态机产生的固定或关联外发。" } }),
 			wechat_control_status: tool({ description: "Report registration, global route and takeover state without sending or polling.", args: {}, async execute(_args, context) { const rootSessionId = await root(context.sessionID); const status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); return `broker=Ready adapter=${status.adapter} takeover=${status.enabled ? "on" : "off"} registered=${status.registered} alias=${status.alias ?? "none"} route=${status.routeReady ? "ready" : "missing"}` } }),
 		},
 		"experimental.chat.system.transform": async (input: any, output: { system: string[] }) => {
 			if (!input.sessionID) return
-			try { const rootSessionId = await root(input.sessionID), status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); if (status.enabled && status.routable) output.system.push("当前处于受限微信接管。不要调用原生 question：它不会被转发到微信。需要用户输入时，只调用一次 wechat_request_input，然后立即结束本回合。该工具仅异步发送检查点；微信回答会成为之后的新用户 turn。") } catch {}
+			try { const rootSessionId = await root(input.sessionID), status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); if (status.enabled && status.routable) output.system.push("当前处于受限微信接管。仅在明确需要时调用 wechat_reply({text}) 向微信发送文字；不要自动复述助手内容。Question/Permission 请求会由系统转发到微信并等待后续回答。") } catch {}
 		},
 		"permission.ask": permissionHook,
 		event: eventHook,

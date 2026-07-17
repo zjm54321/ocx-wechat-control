@@ -1,51 +1,57 @@
-# WeChat Control 0.1.3：受限微信接管
+# WeChat Control 0.2.0：受限微信接管
 
-这是 OpenCode 用户级插件和一个持久 broker worker。它面向**一个微信账号、一个固定聊天窗口**：用户不需要输入、配置或理解 `conversationId`，也没有配对码或联系人选择。首次仅由微信纯文本 `id` 自动认定固定聊天；之后只有同一 sender 能刷新底层 context token。
+这是 OpenCode 用户级插件和持久 broker worker，面向**一个微信账号、一个固定聊天窗口**。首次由微信纯文本 `id` 认定固定 controller；之后只有同一 sender 可以使用或刷新 route。0.2.0 改为原生异步 admission、原生 Question/Permission 转发和显式回复，不再自动镜像 assistant 文本。
 
 ## 安装
 
 要求 Bun 1.3.14 或更高版本：
 
 ```sh
-npm install @mingzzz/ocx-wechat-control@0.1.3
+npm install @mingzzz/ocx-wechat-control@0.2.0
 ```
 
 ```json
 {
-  "plugin": [["@mingzzz/ocx-wechat-control@0.1.3", { "enabled": true }]],
+  "plugin": [["@mingzzz/ocx-wechat-control@0.2.0", { "enabled": true }]],
   "mcp": { "weixin": { "enabled": false } }
 }
 ```
 
-唯一 worker 持有排他锁和唯一 `weixin-mcp@1.7.7` poller；不要同时启用 `mcp.weixin`。首次微信登录仍须安装者在受信环境手动完成。插件不会运行安装器、`npx`、登录或 QR 命令。
+唯一 worker 持有排他锁和唯一 `weixin-mcp@1.7.7` poller，因此不要同时启用 `mcp.weixin`。首次微信登录须在受信环境手动完成；插件不会运行安装器、`npx`、登录或 QR 命令。
 
-## 用户操作
+## 固定 controller 与命令
 
-- 在任一 OpenCode **root session** 执行 `/leave`。插件自动永久编号为 `#1`、`#2`、`#3`……并全局开启接管。同一 root 再次执行会复用原编号，并把标题刷新为本次 `/leave` 时的最新标题。child session 会被拒绝。
-- 在微信发送纯文本 `id`（trim 后必须精确为小写 `id`，不能带参数或多行），会在首次使用时自动认定这个固定聊天，并按编号列出 `#N  标题`。并发的首次 `id` 只会有一个 sender 成功。此命令在接管开启或关闭时都可用；未知标题显示“未命名会话”，不会暴露内部 session ID。回复最多 4000 字符，过长时说明未显示数量。
-- 在已认定的固定微信聊天发送 `#N`、换行、正文，把正文送到对应 root。所有编号共用固定 recipient；该 sender 的合法入站会自动刷新 context。其他 sender 的 `id`、`help` 或 `#N` 均不回复、不注入且不能修改 route。`help`/`#N` 不能完成首次认定。
-- 执行 `/back` 会全局关闭接管并取消现有接管检查点/活动状态，但保留全部编号、标题和全局 route。再次 `/leave` 仍复用原编号。
-- `help` 在接管开关任一状态均可用。接管关闭时普通 `#N` 路由返回固定拒绝。
+- 在 OpenCode **root session** 执行 `/leave`，登记永久编号 `#1`、`#2`……并全局开启接管。重复登记同一 root 会复用编号并刷新标题；child session 不可登记。
+- 在微信发送纯文本小写 `id`。首次成功的 sender 成为固定 controller，并收到 `#N  标题` 列表；其他 sender 不会收到回复或修改 route。
+- 在固定聊天发送 `#N`、换行、正文。broker 立即通过原生 `promptAsync` 将每条消息 admission 到对应 root；同一 root 的 admission 按顺序执行，但不会等待 assistant 完成，连续消息可立即进入原生队列。
+- `/back` 全局关闭接管并清理活动状态，但保留编号、标题和固定 route。再次 `/leave` 可恢复。
+- `help` 和 `id` 在接管开关任一状态都可用。`wechat_control_status` 报告登记、alias、route、adapter 和 takeover 状态。
 
-不存在手工绑定工具；`wechat_bind_session` 已移除。`wechat_control_status` 会报告当前 root 是否登记、alias、全局 route 是否 ready，以及 takeover on/off，不要求 `conversationId`。
+## Question 与 Permission
 
-## 受限接管边界
+接管开启且 route ready 时，OpenCode 原生 Question/Permission 会自动转发到微信，并带稳定的 `QXXXXXX` 或 `PXXXXXX` 编号。多个待处理请求并存时必须在答案前填写编号。
 
-原生 `question` 不会透明转发。接管开启且 root 可路由时，模型应只调用一次 `wechat_request_input` 并结束当前回合；答案之后作为新的 user turn 注入 exact root。每个 root 同时最多一个 active checkpoint，UNKNOWN 状态禁止重放。permission 只有在 broker 确认 enabled、已登记且 route ready 时才 deny，并使用固定通知。
+- 单个 Question：回复选项序号或精确 label；允许自定义时用 `=自定义内容`。
+- 多选 Question：用逗号分隔，例如 `1,3`。
+- 多问题：每行使用 `问题序号: 答案`，例如 `1: 2`。
+- Permission：仅接受精确的 `once` 或 `reject`；不支持 `always`，也不会直接替用户 deny。
+- 显式编号示例：`QABC234 2` 或 `PABC234 reject`。
 
-同步微信注入只调用一次 `client.session.prompt(...)`，等待其直接 assistant 并发送一次关联回复。callback、发送和崩溃不确定性继续按 UNKNOWN-safe/at-most-once 处理；不会自动重放。echo 在路由前按 recipient、context 和 exact payload 带 TTL 抑制。明显非法消息和已识别的 outbound echo 不会刷新全局 route。
+解析失败会保持请求可回答；结果不确定时标记 UNKNOWN，禁止自动重放。
 
-completion 只使用 terminal assistant 与 idle/busy 元数据，不读取 history、reasoning 或消息正文。direct/checkpoint run 不产生额外 generic completion；LOCAL run 固定发送 `#alias\n任务已完成。`（或固定失败文案）。
+## 回复与 typing
 
-## 持久状态和安全
+assistant 内容**不会自动发送到微信**，completion 事件也不会镜像正文。模型只有在确实需要时才显式调用 `wechat_reply({text})`。该调用按 tool call ID 持久去重：相同 ID 和相同文本返回既有 SENT/UNKNOWN；相同 ID 配不同文本会冲突；UNKNOWN 不重试发送。
 
-SQLite schema 为 v5。root registrations 使用永久 `AUTOINCREMENT` alias，保存 root、directory、owner、标题和时间；全局 route 单独保存底层 recipient/context。v4 及更旧数据库在迁移前通过 `VACUUM INTO` 创建 WAL-consistent `pre-v5` 备份；旧 alias/root/directory/owner 保留，标题为 null。旧数据只有一个 distinct conversation 时仅迁移 recipient，context 等待下一条合法入站刷新。v5 重开不重复备份，迁移失败仍报告可打开的备份。
+当已登记 root 存在 queued/busy/retry 工作时，固定聊天显示“正在输入”；全局无工作、关闭接管、启动恢复或 worker 退出时发送 OFF。typing 使用当前 recipient/context，并对 route 变化、失败重试和 shutdown 做竞态保护。
 
-broker 只监听 `127.0.0.1`，RPC 使用 shared secret、instance token、heartbeat、root ownership 和 exact-root callback health。单 worker 锁仅在旧 PID 明确死亡且 authenticated health 失败时接管。上游没有稳定消息 ID，因此入站仍为 at-least-once，出站 UNKNOWN-safe 而非 exactly-once。
+## 持久状态与安全
 
-底层 route metadata 在任何 durable 入站或首次认定之前校验：sender ID 必须为 1–500 字符，context token 必须为 1–4000 字符。空值或超长值不回复、不落入 inbound 表，也不会阻止之后的合法 `id` 认定。
+SQLite schema v6 保存 registrations、全局 route、admission、原生请求、runtime、typing 和 UNKNOWN-safe outbound 状态。启动会把崩溃遗留的 runtime 工作恢复为安全 idle。broker 仅监听 `127.0.0.1`，RPC 使用 shared secret、instance token、heartbeat、root ownership 和 exact-root callback 校验。
 
-## 开发验证
+上游没有稳定消息 ID，因此入站为 at-least-once，外发为 UNKNOWN-safe/at-most-once，而不是 exactly-once。route metadata、文本长度和 callback payload 均有边界校验；outbound echo 在入站路由前按 recipient、context 和精确 payload 带 TTL 抑制。
+
+## 开发与发布检查
 
 ```sh
 bun install
@@ -54,8 +60,6 @@ npm pack --dry-run --json
 git diff --check
 ```
 
-测试使用临时 SQLite、fake client/MCP 和 mock adapter，不登录、poll 或发送真实微信。发布包不包含源码测试、状态库、WAL/SHM、日志、账号或 QR/cache 数据。
+测试使用临时 SQLite、真实本地 callback HTTP 边界、fake SDK client/MCP 和 mock adapter，不登录、poll 或发送真实微信。npm 包只包含 `dist/index.js`、`dist/worker.js`、README、LICENSE 和 package metadata；不包含源码测试、状态库、日志、账号、QR/cache 或项目编排文件。
 
-## 维护者发布
-
-Trusted Publisher 必须绑定 GitHub owner `zjm54321`、repository `ocx-wechat-control`、workflow `publish.yml`。发布 `v0.1.3` 时，先将发布提交 push 到 `main`，再创建并 push `v0.1.3` tag；workflow 校验 tag/version 与 registry 后通过 OIDC 发布。
+维护者发布 `v0.2.0` 时应先完成全部检查并确认 tag 与 package version 一致，再由仓库 Trusted Publisher/OIDC workflow 发布。本项目不会从开发命令自动发布。

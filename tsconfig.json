@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["bun"]
+  },
+  "files": [
+    "src/client.ts",
+    "src/control-client.ts",
+    "src/client-callback.test.ts",
+    "src/broker-flow.test.ts",
+    "src/typing.ts",
+    "src/typing.test.ts",
+    "src/worker.ts",
+    "src/plugin-runtime.ts",
+    "src/plugin-startup.test.ts",
+    "src/plugin-native.test.ts",
+    "src/phase1f.integration.test.ts"
+  ]
+}

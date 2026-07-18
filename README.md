@@ -1,18 +1,18 @@
-# WeChat Control 0.2.1：受限微信接管
+# WeChat Control 0.2.2：受限微信接管
 
-这是 OpenCode 用户级插件和持久 broker worker，面向**一个微信账号、一个固定聊天窗口**。首次由微信纯文本 `id` 认定固定 controller；之后只有同一 sender 可以使用或刷新 route。0.2 系列采用原生异步 admission、原生 Question/Permission 转发和显式回复，不再自动镜像 assistant 文本；0.2.1 是可靠性补丁。
+这是 OpenCode 用户级插件和持久 broker worker，面向**一个微信账号、一个固定聊天窗口**。首次由微信纯文本 `id` 认定固定 controller；之后只有同一 sender 可以使用或刷新 route。0.2 系列采用原生异步 admission、原生 Question/Permission 转发和显式回复，不再自动镜像 assistant 文本；0.2.2 修复已送达的 `weixin_send` 响应被误判为 UNKNOWN。
 
 ## 安装
 
 要求 Bun 1.3.14 或更高版本：
 
 ```sh
-npm install @mingzzz/ocx-wechat-control@0.2.1
+npm install @mingzzz/ocx-wechat-control@0.2.2
 ```
 
 ```json
 {
-  "plugin": [["@mingzzz/ocx-wechat-control@0.2.1", { "enabled": true }]],
+  "plugin": [["@mingzzz/ocx-wechat-control@0.2.2", { "enabled": true }]],
   "mcp": { "weixin": { "enabled": false } }
 }
 ```
@@ -62,4 +62,4 @@ git diff --check
 
 测试使用临时 SQLite、真实本地 callback HTTP 边界、fake SDK client/MCP 和 mock adapter，不登录、poll 或发送真实微信。npm 包只包含 `dist/index.js`、`dist/worker.js`、README、LICENSE 和 package metadata；不包含源码测试、状态库、日志、账号、QR/cache 或项目编排文件。
 
-维护者发布 `v0.2.1` 时应先完成全部检查并确认 tag 与 package version 一致，再由仓库 Trusted Publisher/OIDC workflow 发布。本项目不会从开发命令自动发布。
+维护者发布 `v0.2.2` 时应先完成全部检查并确认 tag 与 package version 一致，再由仓库 Trusted Publisher/OIDC workflow 发布。本项目不会从开发命令自动发布。

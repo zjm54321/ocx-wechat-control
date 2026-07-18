@@ -19,15 +19,11 @@ export function assertWeixinSendSuccess(result: unknown): void {
 	try { value = JSON.parse(item.text) } catch { throw new AdapterSendError("malformed-result") }
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new AdapterSendError("malformed-result")
 	const response = value as Record<string, unknown>
-	const keys = Object.keys(response)
-	// Pinned 1.7.7 passes the send API JSON through unchanged and its own CLI
-	// treats an absent status as success. Accept only the structurally exact empty
-	// response supported by that status-less contract; never arbitrary objects.
-	if (keys.length === 0) return
 	const hasRet = Object.hasOwn(response, "ret"), hasErrcode = Object.hasOwn(response, "errcode")
 	if (hasRet && response.ret !== 0) throw new AdapterSendError("explicit-business-failure")
 	if (hasErrcode && response.errcode !== 0) throw new AdapterSendError("explicit-business-failure")
 	if (Object.hasOwn(response, "error") || Object.hasOwn(response, "errmsg")) throw new AdapterSendError("ambiguous-result")
+	if (!hasRet && !hasErrcode) return
 	if ((hasRet && response.ret === 0) || (hasErrcode && response.errcode === 0)) return
 	throw new AdapterSendError("unknown-result")
 }

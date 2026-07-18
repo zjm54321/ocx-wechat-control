@@ -145,13 +145,16 @@ test("MCP handshake, degraded exit, fail-closed send and fast JSON-RPC response"
 	await adapter.start(async () => {}); expect(adapter.status()).toBe("Ready"); await adapter.send("u", "#1\nok", "ctx")
 	expect(fake.calls.slice(0, 4)).toEqual(["initialize:", "notifications/initialized", "tools/list:", "tools/call:weixin_poll"])
 	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: "{}" }] })).not.toThrow()
+	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: JSON.stringify({ msg_id: "sent" }) }] })).not.toThrow()
+	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: JSON.stringify({ ok: true }) }] })).not.toThrow()
+	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: JSON.stringify({ message: "sent" }) }] })).not.toThrow()
 	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: JSON.stringify({ ret: 0 }) }] })).not.toThrow()
 	expect(() => assertWeixinSendSuccess({ content: [{ type: "text", text: JSON.stringify({ errcode: 0 }) }] })).not.toThrow(); adapter.stop()
 	const exited = new WeixinMcpAdapter({ enabled: true, command: ["node", "fixed.js"], clientFactory: () => new FakeMcp(true), retry: false }); await exited.start(async () => {}); await Bun.sleep(5); expect(exited.status()).toBe("Degraded")
 	const map = new JsonRpcPendingMap(); expect(await map.request((message: any) => map.accept({ jsonrpc: "2.0", id: message.id, result: "fast" }), "fast", {})).toBe("fast")
 })
 
-test("weixin_send parser rejects MCP, business, malformed, ambiguous and unknown failures", () => {
+test("weixin_send parser rejects MCP, business, malformed and ambiguous failures", () => {
 	const failures: Array<[unknown, string]> = [
 		[null, "malformed-result"],
 		[{ isError: true, content: [{ type: "text", text: "{}" }] }, "mcp-error"],
@@ -160,10 +163,9 @@ test("weixin_send parser rejects MCP, business, malformed, ambiguous and unknown
 		[{ content: [{ type: "text", text: JSON.stringify({ ret: 1 }) }] }, "explicit-business-failure"],
 		[{ content: [{ type: "text", text: JSON.stringify({ errcode: 400 }) }] }, "explicit-business-failure"],
 		[{ content: [{ type: "text", text: JSON.stringify({ ret: 0, errcode: 1 }) }] }, "explicit-business-failure"],
+		[{ content: [{ type: "text", text: JSON.stringify({ error: "failed" }) }] }, "ambiguous-result"],
 		[{ content: [{ type: "text", text: JSON.stringify({ ret: 0, errmsg: "failed" }) }] }, "ambiguous-result"],
 		[{ content: [{ type: "text", text: JSON.stringify({ ret: 0, errmsg: "" }) }] }, "ambiguous-result"],
-		[{ content: [{ type: "text", text: JSON.stringify({ ok: true }) }] }, "unknown-result"],
-		[{ content: [{ type: "text", text: JSON.stringify({ message: "sent" }) }] }, "unknown-result"],
 		[{ content: [{ type: "text", text: JSON.stringify({ ret: "0" }) }] }, "explicit-business-failure"],
 	]
 	for (const [value, classification] of failures) {

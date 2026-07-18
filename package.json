@@ -1,6 +1,6 @@
 {
   "name": "@mingzzz/ocx-wechat-control",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Restricted WeChat takeover plugin for OpenCode",
   "type": "module",
   "main": "./dist/index.js",
@@ -21,15 +21,18 @@
     "build": "bun build ./src/index.ts ./src/worker.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk --external @opencode-ai/sdk/v2/client",
     "test": "bun test ./src/core.test.ts ./src/typing.test.ts",
     "test:broker": "bun test ./src/broker-flow.test.ts",
-    "test:callbacks": "bun test ./src/client-callback.test.ts ./src/plugin-startup.test.ts ./src/plugin-native.test.ts",
+    "test:callbacks": "bun test ./src/client-callback.test.ts ./src/worker-compat.test.ts ./src/worker-shutdown.test.ts ./src/plugin-startup.test.ts ./src/plugin-native.test.ts ./src/plugin-lifecycle.test.ts ./src/plugin-reply.test.ts",
     "test:integration": "bun test ./src/phase1f.integration.test.ts",
     "test:dist": "bun test ./src/dist-entry.test.ts",
+    "test:opencode-1.18.3": "bun run build && bun ./scripts/opencode-1.18.3-command-smoke.ts",
+    "test:opencode-runtime": "bun run build && bun ./scripts/opencode-1.18.3-runtime-smoke.ts",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun run test && bun run test:broker && bun run test:callbacks && bun run test:integration && bun run build && bun run test:dist",
     "prepack": "bun run build"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.14.19",
+    "effect": "4.0.0-beta.83",
     "weixin-mcp": "1.7.7"
   },
   "peerDependencies": {

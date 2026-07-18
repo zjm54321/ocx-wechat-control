@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises"
+import { lstat, readdir, readFile, realpath } from "node:fs/promises"
 import * as path from "node:path"
 import { getConfig, sendTyping } from "weixin-mcp/dist/api.js"
 import { ACCOUNTS_DIR } from "weixin-mcp/dist/paths.js"
@@ -7,20 +7,32 @@ import type { Store } from "./core"
 type TypingApi = { getConfig(userId: string, token: string, baseUrl: string, contextToken?: string): Promise<unknown>; sendTyping(userId: string, ticket: string, status: 1 | 2, token: string, baseUrl: string): Promise<unknown> }
 type Account = { token: string; baseUrl: string; accountId: string }
 export interface TypingCoordinatorOptions { api?: TypingApi; accountId?: string; loadAccount?: () => Promise<Account>; debounceMs?: number; retryMs?: number }
+interface AccountConfigOptions { accountsDir?: string }
+
+// Account files contain only a few credentials; reject unexpectedly large input before parsing.
+const MAX_ACCOUNT_FILE_BYTES = 64 * 1024
 
 function object(value: unknown): Record<string, unknown> | undefined { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined }
 function bounded(value: unknown, max: number): value is string { return typeof value === "string" && value.length > 0 && value.length <= max }
 
-async function accountConfig(accountId = process.env.WEIXIN_ACCOUNT_ID): Promise<{ token: string; baseUrl: string; accountId: string }> {
+async function accountConfig(accountId = process.env.WEIXIN_ACCOUNT_ID, options: AccountConfigOptions = {}): Promise<{ token: string; baseUrl: string; accountId: string }> {
 	if (accountId !== undefined && !bounded(accountId, 200)) throw new Error("invalid Weixin account ID")
-	const files = await Array.fromAsync(new Bun.Glob("*.json").scan({ cwd: ACCOUNTS_DIR, onlyFiles: true }))
+	const accountsDir = await realpath(options.accountsDir ?? ACCOUNTS_DIR)
+	const files = (await readdir(accountsDir)).filter((file) => file.endsWith(".json"))
 	const candidates = files.filter((file) => !file.endsWith(".sync.json") && !file.endsWith(".cursor.json"))
 	const selected = accountId ? candidates.find((file) => path.basename(file, ".json") === accountId) : candidates[0]
 	if (!selected) throw new Error("Weixin account unavailable")
-	const parsed = object(JSON.parse(await readFile(path.join(ACCOUNTS_DIR, selected), "utf8")))
+	const selectedPath = path.join(accountsDir, selected), selectedStat = await lstat(selectedPath)
+	if (selectedStat.isSymbolicLink() || !selectedStat.isFile()) throw new Error("invalid Weixin account file")
+	if (selectedStat.size > MAX_ACCOUNT_FILE_BYTES) throw new Error("Weixin account file too large")
+	const canonicalSelectedPath = await realpath(selectedPath), relative = path.relative(accountsDir, canonicalSelectedPath)
+	if (relative === "" || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) throw new Error("invalid Weixin account path")
+	const parsed = object(JSON.parse(await readFile(canonicalSelectedPath, "utf8")))
 	if (!parsed || !bounded(parsed.token, 2000)) throw new Error("Weixin account token unavailable")
 	const baseUrl = typeof parsed.baseUrl === "string" ? parsed.baseUrl : typeof parsed.base_url === "string" ? parsed.base_url : "https://ilinkai.weixin.qq.com"
-	if (!/^https?:\/\//.test(baseUrl) || baseUrl.length > 500) throw new Error("invalid Weixin base URL")
+	let url: URL
+	try { url = new URL(baseUrl) } catch { throw new Error("invalid Weixin base URL") }
+	if (url.protocol !== "https:" || baseUrl.length > 500) throw new Error("invalid Weixin base URL")
 	return { token: parsed.token, baseUrl, accountId: path.basename(selected, ".json") }
 }
 

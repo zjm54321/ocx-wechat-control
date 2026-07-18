@@ -1,4 +1,4 @@
-import { readLock, authenticatedHealth, pidStatus } from "./worker-runtime"
+import { readLock, authenticatedHealth, authenticatedWorkerHealth, pidStatus } from "./worker-runtime"
 import { initializeState, isPlainText } from "./core"
 import { makeRpcRequest } from "./broker"
 import * as path from "node:path"
@@ -172,20 +172,8 @@ export function createCallbackHandler(client: LegacyCallbackClient, sharedSecret
 		if (pathname === "/health") {
 			try { const body = object(await request.json()); if (!body) return Response.json({ error: "bad-request" }, { status: 400 }); if (body.rootSessionId) { if (!boundedString(body.rootSessionId)) return Response.json({ error: "bad-request" }, { status: 400 }); const response = object(await client.session.get({ path: { id: body.rootSessionId } })), session = sessionIdentity(response?.data); if (!session || session.id !== body.rootSessionId || session.parentID) return Response.json({ error: "not-root" }, { status: 409 }) }; return Response.json({ ok: true }) } catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
 		}
-		if (pathname !== "/inject") return controlClient ? handleV2Callback(pathname, request, controlClient) : Response.json({ error: "v2-client-unavailable" }, { status: 503 })
-		let stage = "request"
-		try {
-			const body = object(await request.json()), envelope = object(body?.envelope)
-			if (!body || typeof body.rootSessionId !== "string" || typeof body.directory !== "string" || typeof body.text !== "string" || typeof body.inboundId !== "string" || !envelope || (envelope.kind !== "inbound" && (envelope.kind !== "checkpoint" || typeof envelope.checkpointId !== "string"))) return Response.json({ error: "bad-request" }, { status: 400 })
-			stage = "session"
-			const session = object(await client.session.get({ path: { id: body.rootSessionId } })), identity = sessionIdentity(session?.data)
-			if (!identity || identity.id !== body.rootSessionId || identity.parentID) return Response.json({ error: "not-root" }, { status: 409 })
-			stage = "prompt"
-			const promptText = envelope.kind === "checkpoint" ? `[受限微信接管：异步检查点回答 ${envelope.checkpointId}]\n${body.text}` : body.text
-			const result = await client.session.prompt({ path: { id: body.rootSessionId }, query: { directory: body.directory }, body: { parts: [{ type: "text", text: promptText }] }, signal: request.signal })
-			stage = "response"
-			return Response.json({ ok: true, ...extractPromptAssistant(result) })
-		} catch { return Response.json({ error: "inject-failed", stage }, { status: 409 }) }
+		if (pathname === "/inject") return Response.json({ error: "legacy-inject-removed" }, { status: 410 })
+		return controlClient ? handleV2Callback(pathname, request, controlClient) : Response.json({ error: "v2-client-unavailable" }, { status: 503 })
 	}
 }
 
@@ -208,8 +196,12 @@ export function requestInputRpc(endpoint: string, secret: string, body: object):
 export async function connectOrStartWorker(options: WorkerOptions): Promise<{ endpoint: string; secret: string; adapter: string }> {
 	const state = await initializeState()
 	let lock = await readLock(state.directory)
-	if (!lock || !(await authenticatedHealth(lock, state.secret))) {
-		if (lock && pidStatus(lock.pid) !== "dead") throw new Error("Broker unavailable and existing PID is alive or unknown; takeover refused")
+	const inspection = lock ? await authenticatedWorkerHealth(lock, state.secret) : undefined
+	if (!lock || !inspection?.authenticated || inspection.issue) {
+		if (lock && pidStatus(lock.pid) !== "dead") {
+			if (inspection?.authenticated && inspection.issue) throw new Error(`Incompatible broker worker (${inspection.issue}); restart the existing worker PID ${lock.pid} before loading this plugin`)
+			throw new Error("Broker unavailable and existing PID is alive or unknown; takeover refused")
+		}
 		const builtWorker = path.join(import.meta.dir, "worker.js"), workerPath = existsSync(builtWorker) ? builtWorker : path.join(import.meta.dir, "worker.ts")
 		const bun = Bun.which("bun") ?? process.execPath
 		const encoded = Buffer.from(JSON.stringify(options)).toString("base64url")

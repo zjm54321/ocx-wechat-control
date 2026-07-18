@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test"
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import * as path from "node:path"
 import { Store } from "./core"
-import { TypingCoordinator } from "./typing"
+import { accountConfig, TypingCoordinator } from "./typing"
 import { BrokerService } from "./broker"
 import { MockWeChatAdapter } from "./adapter"
 import { runWorker } from "./worker"
@@ -11,6 +14,41 @@ function setup() {
 	store.acceptInboundRoute("user", "context", true)
 	return store
 }
+
+describe("account loading", () => {
+	test("loads a regular contained HTTPS account file", async () => {
+		await withAccounts(async (accountsDir) => {
+			await writeFile(path.join(accountsDir, "selected.json"), JSON.stringify({ token: "secret", baseUrl: "https://example.test/api" }))
+			await expect(accountConfig("selected", { accountsDir })).resolves.toEqual({ token: "secret", baseUrl: "https://example.test/api", accountId: "selected" })
+		})
+	})
+	test("rejects plaintext HTTP base URLs", async () => {
+		await withAccounts(async (accountsDir) => {
+			await writeFile(path.join(accountsDir, "selected.json"), JSON.stringify({ token: "secret", baseUrl: "http://127.0.0.1:8080" }))
+			await expect(accountConfig("selected", { accountsDir })).rejects.toThrow("invalid Weixin base URL")
+		})
+	})
+	test("rejects oversized account files before parsing", async () => {
+		await withAccounts(async (accountsDir) => {
+			await writeFile(path.join(accountsDir, "selected.json"), " ".repeat(64 * 1024 + 1))
+			await expect(accountConfig("selected", { accountsDir })).rejects.toThrow("Weixin account file too large")
+		})
+	})
+	test("rejects symlinked account files outside the account directory", async () => {
+		await withAccounts(async (accountsDir, root) => {
+			const outside = path.join(root, "outside.json")
+			await writeFile(outside, JSON.stringify({ token: "secret", baseUrl: "https://example.test" }))
+			await symlink(outside, path.join(accountsDir, "selected.json"), "file")
+			await expect(accountConfig("selected", { accountsDir })).rejects.toThrow("invalid Weixin account file")
+		})
+	})
+	test("does not select non-regular JSON entries", async () => {
+		await withAccounts(async (accountsDir) => {
+			await mkdir(path.join(accountsDir, "selected.json"))
+			await expect(accountConfig("selected", { accountsDir })).rejects.toThrow("invalid Weixin account file")
+		})
+	})
+})
 
 describe("typing coordinator", () => {
 	test("turns off at startup and aggregates active work", async () => {
@@ -39,12 +77,16 @@ describe("typing coordinator", () => {
 		expect(calls.length).toBeGreaterThan(1)
 		await typing.shutdown(); store.close()
 	})
-	test("expires stale work and cancels typing", async () => {
+	test("keeps typing on after lease expiry until the active admission finishes", async () => {
 		const store = setup(), calls: number[] = [], typing = coordinator(store, calls)
-		const now = Date.now(); seedWork(store, now, 100)
+		const now = Date.now(), expiredAt = now + 60_001; seedWork(store, now, 60_000)
 		await typing.flush(); expect(calls.at(-1)).toBe(1)
-		typing.refresh(now + 101); await Bun.sleep(5)
-		expect(store.runtime("root")?.workPending).toBe(false); expect(calls.at(-1)).toBe(2)
+		expect(store.expireRuntimeLeases(expiredAt)).toBe(0)
+		expect(store.runtime("root")).toMatchObject({ status: "QUEUED", admissionCount: 1, workPending: true }); expect(store.desiredTyping()).toBe(true)
+		await typing.flush(); expect(calls.at(-1)).toBe(1)
+		expect(store.finishRuntimeAdmission("s", "root", "owner")).toBe(true); expect(store.expireRuntimeLeases(expiredAt)).toBe(1)
+		expect(store.runtime("root")).toMatchObject({ status: "IDLE", admissionCount: 0, workPending: false }); expect(store.desiredTyping()).toBe(false)
+		await typing.flush(); expect(calls.at(-1)).toBe(2)
 		await typing.shutdown(); store.close()
 	})
 	test("authenticated broker status, back, and reply replay refresh production typing", async () => {
@@ -101,3 +143,4 @@ describe("typing coordinator", () => {
 
 function coordinator(store: Store, calls: number[]): TypingCoordinator { return new TypingCoordinator(store, { loadAccount: async () => ({ token: "t", baseUrl: "https://example.test", accountId: "selected" }), api: { getConfig: async () => ({ typing_ticket: "ticket" }), sendTyping: async (_u, _t, status) => { calls.push(status) } }, debounceMs: 0, retryMs: 5 }) }
 function seedWork(store: Store, now = Date.now(), leaseMs = 1000): void { store.claimPromptSubmission({ submissionId: "s", inboundId: "i", root: "root", owner: "owner", alias: 1, messageId: "m", body: "hello", revision: store.control().revision }); store.beginRuntimeAdmission("s", "root", "owner", now, leaseMs) }
+async function withAccounts(run: (accountsDir: string, root: string) => Promise<void>): Promise<void> { const root = await mkdtemp(path.join(tmpdir(), "ocx-typing-")), accountsDir = path.join(root, "accounts"); await mkdir(accountsDir); try { await run(accountsDir, root) } finally { await rm(root, { recursive: true, force: true }) } }

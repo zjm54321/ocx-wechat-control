@@ -12,6 +12,7 @@
     "src/client.ts",
     "src/control-client.ts",
     "src/client-callback.test.ts",
+    "src/worker-compat.test.ts",
     "src/broker-flow.test.ts",
     "src/typing.ts",
     "src/typing.test.ts",

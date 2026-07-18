@@ -5,11 +5,12 @@ import { tmpdir } from "node:os"
 import * as path from "node:path"
 import { AdapterSendError, assertWeixinSendSuccess, JsonRpcPendingMap, MockWeChatAdapter, WeixinMcpAdapter, type McpClient } from "./adapter"
 import { BrokerService, clampCallbackTimeout } from "./broker"
-import { ClientLifecycleRegistry, createCallbackHandler, extractPromptAssistant, resolveRootSession } from "./client"
+import { ClientLifecycleRegistry, createCallbackHandler, resolveRootSession } from "./client"
 import { CONTROL_OFF_TEXT, HELP_TEXT, MAX_CONTEXT_TOKEN_LENGTH, MAX_ROUTE_ID_LENGTH, PERMISSION_DENIED_TEXT, Store, allocateRequestCode, formatOutbound, formatRegistrationList, parseInboundText, parsePollToolResult, sanitizeTitle } from "./core"
 import { runWorker } from "./worker"
 import { decideExistingBroker, pidStatus, readLock } from "./worker-runtime"
-import { ControlCommandHandled, captureReplyCallID, createControlCommandHook, createControlEventHook, createPermissionHook, registerControlCommands, resolveWeixinCommand } from "./plugin-runtime"
+import { captureReplyCallID, createControlCommandHook, createControlEventHook, createPermissionHook, registerControlCommands, resolveWeixinCommand } from "./plugin-runtime"
+import { HttpServerResponse } from "effect/unstable/http"
 
 const tempRoot = path.join(tmpdir(), "ocx-wechat-control-tests")
 mkdirSync(tempRoot, { recursive: true })
@@ -36,17 +37,29 @@ test("root registrations allocate permanent aliases idempotently and sanitize la
 	store.close()
 })
 
+test("binding activity defaults on old v6 data and aliases are never reused", () => {
+	const filename = tempFile("binding-active-v6"), legacy = new Database(filename)
+	legacy.exec("PRAGMA user_version=6; CREATE TABLE bindings(alias INTEGER PRIMARY KEY AUTOINCREMENT,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); INSERT INTO bindings VALUES(4,'historical','d','owner','Old','now','now');")
+	legacy.close()
+	const store = new Store(filename)
+	expect(store.bindingForRoot("historical")).toMatchObject({ alias: 4, active: true })
+	expect(store.deactivateBinding("historical", "owner")).toBe(true); expect(store.bindings()).toEqual([])
+	expect(store.bind({ rootSessionId: "new-root", directory: "d", ownerInstance: "owner" }).alias).toBe(5)
+	expect(store.bind({ rootSessionId: "historical", directory: "new-d", ownerInstance: "owner", title: "Refreshed" })).toMatchObject({ alias: 4, active: true, title: "Refreshed" })
+	store.close(); cleanup(filename)
+})
+
 test("registration list is ordered, hides roots and remains within adapter limit", () => {
-	const bindings = Array.from({ length: 80 }, (_, index) => ({ alias: 80 - index, rootSessionId: `secret-${index}`, directory: "d", ownerInstance: "o", title: "会".repeat(120) }))
+	const bindings = Array.from({ length: 80 }, (_, index) => ({ alias: 80 - index, rootSessionId: `secret-${index}`, directory: "d", ownerInstance: "o", title: "会".repeat(120), active: true }))
 	const text = formatRegistrationList(bindings); expect(text.length).toBeLessThanOrEqual(4000); expect(text).toContain("#1  "); expect(text).toContain("另有"); expect(text).not.toContain("secret-")
 })
 
 test("wechat id lists registrations on and off without callback and refreshes global route", async () => {
 	let callbacks = 0
 	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(), broker = new BrokerService(store, adapter, "secret", "worker", async () => { callbacks++; return Response.json({}) })
-	store.bind({ rootSessionId: "r1", directory: "d", ownerInstance: "owner", title: "First" }); store.bind({ rootSessionId: "r2", directory: "d", ownerInstance: "owner", title: null }); store.setControl(false)
+	store.bind({ rootSessionId: "r1", directory: "d", ownerInstance: "owner", title: "First" }); store.bind({ rootSessionId: "r2", directory: "d", ownerInstance: "owner", title: null }); store.deactivateBinding("r2", "owner"); store.setControl(false)
 	await broker.handleInbound({ id: "list-off", fromUserId: "recipient-a", contextToken: "ctx-a", text: "id", cursorHint: "a" })
-	expect(adapter.sent.at(-1)).toMatchObject({ to: "recipient-a", contextToken: "ctx-a", text: "#1  First\n#2  未命名会话" }); expect(store.route()).toMatchObject({ conversationId: "recipient-a", contextToken: "ctx-a" })
+	expect(adapter.sent.at(-1)).toMatchObject({ to: "recipient-a", contextToken: "ctx-a", text: "#1  First" }); expect(store.route()).toMatchObject({ conversationId: "recipient-a", contextToken: "ctx-a" })
 	store.setControl(true); await broker.handleInbound({ id: "list-on", fromUserId: "recipient-a", contextToken: "ctx-b", text: " id ", cursorHint: "b" })
 	expect(store.route()).toMatchObject({ conversationId: "recipient-a", contextToken: "ctx-b" }); expect(callbacks).toBe(0); store.close()
 })
@@ -94,6 +107,21 @@ test("poll key includes cursor and message index", () => {
 	const msg = { message_type: 1, from_user_id: "user", context_token: "ctx", item_list: [{ type: 1, text_item: { text: "same" } }] }
 	const result = { content: [{ type: "text", text: JSON.stringify({ get_updates_buf: "cursor", msgs: [msg, msg] }) }] }
 	const parsed = parsePollToolResult(result); expect(parsed).toHaveLength(2); expect(parsed[0].id).not.toBe(parsed[1].id); expect(parsePollToolResult(result)[0].id).toBe(parsed[0].id)
+})
+
+test("prompt message IDs are canonical monotonic and durable across duplicate claims restarts and clock rollback", async () => {
+	const filename = tempFile("prompt-message-id"), future = Date.now() + 60_000
+	let store = new Store(filename), peer = new Store(filename)
+	store.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('prompt_message_id_clock',?)").run(`${future}:7`)
+	const input = { submissionId: "same", inboundId: "same-inbound", root: "root", owner: "owner", alias: 1, body: "one" }
+	const [first, duplicate] = await Promise.all([Promise.resolve().then(() => store.claimPromptSubmission(input)!), Promise.resolve().then(() => peer.claimPromptSubmission(input)!)])
+	expect(first.messageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/); expect(duplicate.messageId).toBe(first.messageId)
+	const second = store.claimPromptSubmission({ ...input, submissionId: "second", inboundId: "second-inbound", body: "two" })!
+	expect(second.messageId > first.messageId).toBe(true)
+	peer.close(); store.close(); store = new Store(filename)
+	const afterRestart = store.claimPromptSubmission({ ...input, submissionId: "restart", inboundId: "restart-inbound", body: "three" })!
+	expect(afterRestart.messageId > second.messageId).toBe(true); expect(store.promptSubmission("same")?.messageId).toBe(first.messageId)
+	store.close(); cleanup(filename)
 })
 
 class FakeMcp implements McpClient {
@@ -144,32 +172,13 @@ test("weixin_send parser rejects MCP, business, malformed, ambiguous and unknown
 	}
 })
 
-function fakeClient(prompt: () => Promise<any>) {
-	let prompts = 0
-	let promptOptions: any
-	return { get prompts() { return prompts }, get promptOptions() { return promptOptions }, session: { get: async () => ({ data: { id: "root" } }), prompt: async (options: any) => { prompts++; promptOptions = options; return prompt() } } }
-}
 function injectRequest(method = "POST", envelope: any = { kind: "inbound" }): Request { return new Request("http://127.0.0.1/inject", { method, headers: { "x-wechat-control-key": "secret", "x-wechat-instance-token": "token", "content-type": "application/json" }, body: method === "POST" ? JSON.stringify({ rootSessionId: "root", directory: "d", text: "hello", inboundId: "in", envelope }) : undefined }) }
 
-test("callback waits for one synchronous prompt and returns only its direct assistant", async () => {
-	const client = fakeClient(async () => { await Bun.sleep(10); return { data: { info: { id: "assistant", parentID: "msg_user_generated", role: "assistant" }, parts: [{ type: "reasoning", text: "hidden" }, { type: "text", text: "final" }] } } })
-	const response = await createCallbackHandler(client, "secret", "token")(injectRequest()); expect(response.status).toBe(200)
-	const body = await response.json() as any; expect(body.promptMessageId).toBe("msg_user_generated"); expect(body.assistantMessageId).toBe("assistant"); expect(body.text).toBe("final"); expect(client.prompts).toBe(1)
-	expect(Object.hasOwn(client.promptOptions.body, "messageID")).toBe(false)
-	expect(extractPromptAssistant({ data: { info: { id: "a", parentID: "msg_parent", role: "assistant" }, parts: [{ type: "text", text: "x" }] } })).toEqual({ promptMessageId: "msg_parent", assistantMessageId: "a", text: "x" })
-})
-
-test("callback no-text, thrown prompt, invalid shape and GET all fail without reinjection", async () => {
-	for (const result of [
-		async () => ({ data: { info: { id: "a", parentID: "msg_parent", role: "assistant" }, parts: [{ type: "tool" }] } }),
-		async () => { throw new Error("prompt failed") },
-		async () => ({ data: { info: { id: "u", parentID: "msg_parent", role: "user" }, parts: [{ type: "text", text: "bad" }] } }),
-		async () => ({ data: { info: { id: "a", role: "assistant" }, parts: [{ type: "text", text: "missing parent" }] } }),
-		async () => ({ data: { info: { id: "a", parentID: "not-a-message-id", role: "assistant" }, parts: [{ type: "text", text: "bad parent" }] } }),
-	]) {
-		const client = fakeClient(result); const response = await createCallbackHandler(client, "secret", "token")(injectRequest()); expect(response.status).toBe(409); expect(client.prompts).toBe(1)
-	}
-	const getClient = fakeClient(async () => { throw new Error("must not run") }); expect((await createCallbackHandler(getClient, "secret", "token")(injectRequest("GET"))).status).toBe(405); expect(getClient.prompts).toBe(0)
+test("legacy inject is rejected without SDK mutation", async () => {
+	let gets = 0, prompts = 0
+	const client = { session: { get: async () => { gets++; return { data: { id: "root" } } }, prompt: async () => { prompts++; return {} } } }
+	const response = await createCallbackHandler(client, "secret", "token")(injectRequest()); expect(response.status).toBe(410); expect(gets).toBe(0); expect(prompts).toBe(0)
+	expect((await createCallbackHandler(client, "secret", "token")(injectRequest("GET"))).status).toBe(405); expect(gets).toBe(0); expect(prompts).toBe(0)
 })
 
 function readyBroker(fetcher: typeof fetch) {
@@ -295,8 +304,16 @@ test("leave-root RPC verifies exact root and allocates or refreshes registration
 	const broker = new BrokerService(store, adapter, "secret", "worker", async (_url, init) => { const body = JSON.parse(String(init?.body)); checked.push(body.rootSessionId); return body.rootSessionId === "child" ? Response.json({ error: "not-root" }, { status: 409 }) : Response.json({ ok: true }) })
 	const leave = async (rootSessionId: string, title: string) => broker.handleRequest(authenticatedRequest("leave-root", { rootSessionId, directory: "d", title }))
 	const aliases: number[] = []; for (const root of ["r1", "r2", "r3"]) aliases.push(((await (await leave(root, root)).json()) as any).binding.alias)
-	expect(aliases).toEqual([1, 2, 3]); expect(((await (await leave("r2", "new-title")).json()) as any).binding).toMatchObject({ alias: 2, title: "new-title" }); expect(store.control().enabled).toBe(true)
+	expect(aliases).toEqual([1, 2, 3]); store.deactivateBinding("r2", "owner"); expect(((await (await leave("r2", "new-title")).json()) as any).binding).toMatchObject({ alias: 2, title: "new-title", active: true }); expect(store.control().enabled).toBe(true)
 	expect((await leave("child", "bad")).status).toBe(409); expect(store.bindingForRoot("child")).toBeUndefined(); expect(checked).toEqual(["r1", "r2", "r3", "r2", "child"]); store.close()
+})
+
+test("explicit not-root health and runtime observations deactivate only their binding", async () => {
+	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "Root" })
+	const broker = new BrokerService(store, adapter, "secret", "worker", async (url) => Response.json({ error: "not-root" }, { status: 409 }))
+	const observed = await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); expect(await observed.json()).toMatchObject({ observed: false }); expect(store.bindingForRoot("root")?.active).toBe(false)
+	store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "Again" }); const leave = await broker.handleRequest(authenticatedRequest("leave-root", { rootSessionId: "root", directory: "d", title: "No longer root" })); expect(leave.status).toBe(409); expect(store.bindingForRoot("root")?.active).toBe(false); expect(store.bindingForRoot("root")?.alias).toBe(1)
+	store.close()
 })
 
 test("live owner blocks rebind; stale exact-root rebind clears checkpoint and activity", async () => {
@@ -314,10 +331,10 @@ test("live owner blocks rebind; stale exact-root rebind clears checkpoint and ac
 	expect(store.completePendingAndClaim("old", "root", "old-flight", "p", "a", "late", store.control().revision)).toBeUndefined(); store.close()
 })
 
-test("callback health and injection reject mismatched returned session IDs", async () => {
+test("callback health rejects mismatched returned session IDs while inject stays removed", async () => {
 	const client = { session: { get: async () => ({ data: { id: "different" } }), prompt: async () => { throw new Error("must not prompt") } } }, handler = createCallbackHandler(client, "secret", "token")
 	const health = new Request("http://127.0.0.1/health", { method: "POST", headers: { "x-wechat-control-key": "secret", "x-wechat-instance-token": "token", "content-type": "application/json" }, body: JSON.stringify({ rootSessionId: "root" }) }); expect((await handler(health)).status).toBe(409)
-	expect((await handler(injectRequest())).status).toBe(409)
+	expect((await handler(injectRequest())).status).toBe(410)
 })
 
 test("global control revision, back cancellation and v3 crash recovery are durable", () => {
@@ -370,15 +387,15 @@ test("commands are conflict-safe, clear sentinels, reject arguments and always t
 	const config: any = {}; registerControlCommands(config); expect(config.command.leave.template).toContain("LEAVE_HANDLED"); expect(() => registerControlCommands(config)).not.toThrow(); expect(() => registerControlCommands({ command: { back: {} } })).toThrow("command conflict")
 	const calls: any[] = [], toasts: boolean[] = []; const rpcCall: any = async (_e: string, _s: string, body: any) => { calls.push(body); return { ok: true, binding: { alias: 1 } } }
 	const hook = createControlCommandHook(rpcCall, async (enabled) => { toasts.push(enabled) }, "e", "s", "i", "t", async (id) => ({ data: { id, title: "Title" } }), "d"), output = { parts: [{ type: "text", text: "sentinel" }] }
-	await expect(hook({ command: "leave", arguments: "", sessionID: "root" }, output)).rejects.toBeInstanceOf(ControlCommandHandled); expect(output.parts).toHaveLength(0); expect(calls[0]).toMatchObject({ method: "leave-root", rootSessionId: "root", title: "Title" }); expect(toasts).toEqual([true])
-	await expect(hook({ command: "back", arguments: "bad" }, { parts: [1] })).rejects.toBeInstanceOf(ControlCommandHandled); expect(calls).toHaveLength(1)
-	const failed = createControlCommandHook(async () => { throw new Error("rpc") }, async () => {}, "e", "s", "i", "t"); await expect(failed({ command: "back", arguments: "" }, { parts: [1] })).rejects.toBeInstanceOf(ControlCommandHandled)
+	const leave = await hook({ command: "leave", arguments: "", sessionID: "root" }, output).catch((error) => error); expect(HttpServerResponse.isHttpServerResponse(leave)).toBe(true); expect(leave.status).toBe(204); expect(leave.headers["x-ocx-command"]).toBe("leave:1"); expect(output.parts).toHaveLength(0); expect(calls[0]).toMatchObject({ method: "leave-root", rootSessionId: "root", title: "Title" }); expect(toasts).toEqual([true])
+	const invalid = await hook({ command: "back", arguments: "bad" }, { parts: [1] }).catch((error) => error); expect(HttpServerResponse.isHttpServerResponse(invalid)).toBe(true); expect(invalid.status).toBe(400); expect(calls).toHaveLength(1)
+	const failed = createControlCommandHook(async () => { throw new Error("rpc") }, async () => {}, "e", "s", "i", "t"), unavailable = await failed({ command: "back", arguments: "" }, { parts: [1] }).catch((error) => error); expect(HttpServerResponse.isHttpServerResponse(unavailable)).toBe(true); expect(unavailable.status).toBe(503)
 })
 
 test("leave rejects child sessions before RPC", async () => {
 	let calls = 0
 	const hook = createControlCommandHook((async () => { calls++; return {} }) as any, async () => {}, "e", "s", "i", "t", async (id) => ({ data: { id, parentID: "root", title: "child" } }), "d")
-	await expect(hook({ command: "leave", arguments: "", sessionID: "child" }, { parts: [1] })).rejects.toBeInstanceOf(ControlCommandHandled); expect(calls).toBe(0)
+	const response = await hook({ command: "leave", arguments: "", sessionID: "child" }, { parts: [1] }).catch((error) => error); expect(HttpServerResponse.isHttpServerResponse(response)).toBe(true); expect(response.status).toBe(503); expect(calls).toBe(0)
 })
 
 test("permission hook always leaves controlled permission at native ask", async () => {
@@ -575,7 +592,7 @@ test("uncertain native relay stays OPEN and resolves remotely without relay retr
 test("startup recovery transitions v6 uncertainty states and resets admission counts", () => {
 	const filename = tempFile("v6-recovery"), store = new Store(filename); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.refreshRoute("recipient", "ctx")
 	store.claimPromptSubmission({ submissionId: "prompt", inboundId: "in", root: "root", owner: "owner", alias: 1, messageId: "msg", body: "x" }); store.openNativeRequest({ requestId: "announce", requestKey: "announce", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.openNativeRequest({ requestId: "resolve", requestKey: "resolve", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement("resolve", true); store.claimNativeResolution("resolve", "answer"); expect(store.beginRuntimeAdmission("prompt", "root", "owner", 100, 1000)).toBe(1); store.close()
-	const recovered = new Store(filename); expect(recovered.promptSubmission("prompt")?.state).toBe("UNKNOWN"); expect(recovered.nativeRequest("announce")?.state).toBe("OPEN"); expect(recovered.nativeRequest("resolve")?.state).toBe("UNKNOWN"); expect(recovered.runtime("root")).toMatchObject({ status: "IDLE", admissionCount: 0, workPending: false }); recovered.close(); cleanup(filename)
+	const recovered = new Store(filename); expect(recovered.promptSubmission("prompt")).toMatchObject({ state: "UNKNOWN", admissionFinished: true }); expect(recovered.nativeRequest("announce")?.state).toBe("OPEN"); expect(recovered.nativeRequest("resolve")?.state).toBe("UNKNOWN"); expect(recovered.runtime("root")).toMatchObject({ status: "IDLE", admissionCount: 0, workPending: false }); recovered.close(); cleanup(filename)
 })
 
 test("runtime generation protects newer work, aggregates roots, honors authoritative idle and lease expiry", () => {
@@ -586,5 +603,27 @@ test("runtime generation protects newer work, aggregates roots, honors authorita
 	claim("duplicate-one", "a", 1); const duplicateOne = store.beginRuntimeAdmission("duplicate-one", "a", "owner", 105, 1000)!; claim("duplicate-two", "a", 1); const duplicateTwo = store.beginRuntimeAdmission("duplicate-two", "a", "owner", 106, 1000)!; expect(store.runtime("a")?.admissionCount).toBe(2); expect(store.finishRuntimeAdmission("duplicate-one", "a", "owner")).toBe(true); expect(store.runtime("a")?.admissionCount).toBe(1); expect(store.finishRuntimeAdmission("duplicate-one", "a", "owner")).toBe(true); expect(store.runtime("a")?.admissionCount).toBe(1); expect(store.finishRuntimeAdmission("duplicate-two", "a", "owner")).toBe(true); expect(store.runtime("a")?.admissionCount).toBe(0); expect(store.syncRuntimeAuthoritative("a", "owner", "IDLE", duplicateTwo, 107)).toBe(true); expect(duplicateTwo).toBeGreaterThan(duplicateOne)
 	claim("a2", "a", 1); const a2 = store.beginRuntimeAdmission("a2", "a", "owner", 110, 1000)!; expect(store.finishRuntimeAdmission("a2", "a", "owner")).toBe(true); expect(store.observeRuntimeStatus("a", "owner", "BUSY", a2, 111)).toBe(true); claim("a3", "a", 1); const a3 = store.beginRuntimeAdmission("a3", "a", "owner", 112, 1000)!; expect(a3).toBeGreaterThan(a2); expect(store.finishRuntimeAdmission("a3", "a", "owner")).toBe(true); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a2, 113)).toBe(false); expect(store.runtime("a")).toMatchObject({ generation: a3, status: "BUSY", workPending: true }); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a3, 114)).toBe(false); expect(store.observeRuntimeStatus("a", "owner", "BUSY", a3, 115)).toBe(true); expect(store.observeRuntimeStatus("a", "owner", "IDLE", a3, 116)).toBe(true)
 	claim("b1", "b", 2); const b1 = store.beginRuntimeAdmission("b1", "b", "owner", 120, 1000)!; expect(store.finishRuntimeAdmission("b1", "b", "owner")).toBe(true); expect(store.desiredTyping(121)).toBe(true); expect(store.syncRuntimeAuthoritative("b", "owner", "IDLE", b1, 122)).toBe(true); expect(store.desiredTyping(123)).toBe(false)
-	claim("lease", "a", 1); const leased = store.beginRuntimeAdmission("lease", "a", "owner", 200, 10)!; expect(store.desiredTyping(205)).toBe(true); expect(store.expireRuntimeLeases(211)).toBe(1); expect(store.runtime("a")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.observeRuntimeStatus("a", "owner", "IDLE", leased, 220)).toBe(false); store.close()
+	claim("lease", "a", 1); const leased = store.beginRuntimeAdmission("lease", "a", "owner", 200, 10)!; expect(store.desiredTyping(205)).toBe(true); expect(store.expireRuntimeLeases(211)).toBe(0); expect(store.runtime("a")).toMatchObject({ generation: leased, status: "QUEUED", admissionCount: 1, workPending: true }); expect(store.syncRuntimeAuthoritative("a", "owner", "IDLE", leased, 212, 10)).toBe(true); expect(store.runtime("a")).toMatchObject({ generation: leased, status: "QUEUED", admissionCount: 1, workPending: true, leaseExpiresMs: 222 }); expect(store.finishRuntimeAdmission("lease", "a", "owner")).toBe(true); expect(store.expireRuntimeLeases(223)).toBe(1); store.close()
+})
+
+test("definite prompt rejection clears only its current queued generation", () => {
+	const store = new Store(":memory:"), claim = (id: string) => store.claimPromptSubmission({ submissionId: id, inboundId: `in-${id}`, root: "root", owner: "owner", alias: 1, body: id })!
+	claim("rejected"); const rejectedGeneration = store.beginRuntimeAdmission("rejected", "root", "owner", 100, 1000)!; expect(store.rejectPromptSubmissionNoEffect("rejected", "root", "owner", "not-root")).toBe(true); expect(store.promptSubmission("rejected")).toMatchObject({ state: "REJECTED", admissionFinished: true }); expect(store.runtime("root")).toMatchObject({ status: "IDLE", generation: rejectedGeneration + 1, admissionCount: 0, workPending: false })
+	claim("busy"); const busyGeneration = store.beginRuntimeAdmission("busy", "root", "owner", 110, 1000)!; expect(store.observeRuntimeStatus("root", "owner", "BUSY", busyGeneration, 111, 1000)).toBe(true); expect(store.rejectPromptSubmissionNoEffect("busy", "root", "owner")).toBe(true); expect(store.runtime("root")).toMatchObject({ status: "BUSY", generation: busyGeneration, admissionCount: 0, workPending: true })
+	claim("stale"); const staleGeneration = store.beginRuntimeAdmission("stale", "root", "owner", 120, 1000)!; claim("newer"); const newerGeneration = store.beginRuntimeAdmission("newer", "root", "owner", 121, 1000)!; expect(newerGeneration).toBeGreaterThan(staleGeneration); expect(store.observeRuntimeStatus("root", "owner", "BUSY", newerGeneration, 122, 1000)).toBe(true); expect(store.rejectPromptSubmissionNoEffect("stale", "root", "owner")).toBe(true); expect(store.runtime("root")).toMatchObject({ status: "BUSY", generation: newerGeneration, admissionCount: 1, workPending: true }); expect(store.rejectPromptSubmissionNoEffect("stale", "root", "owner")).toBe(true); expect(store.runtime("root")?.admissionCount).toBe(1); expect(store.finishRuntimeAdmission("newer", "root", "owner")).toBe(true); expect(store.runtime("root")).toMatchObject({ status: "BUSY", generation: newerGeneration, admissionCount: 0, workPending: true }); store.close()
+})
+
+test("queued active admissions are maintenance snapshots and authoritative idle only renews them", () => {
+	const store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "directory", ownerInstance: "owner" })
+	store.claimPromptSubmission({ submissionId: "queued", inboundId: "queued-in", root: "root", owner: "owner", alias: 1, body: "queued" }); const generation = store.beginRuntimeAdmission("queued", "root", "owner", 100, 10)!
+	expect(store.activeRuntimeSnapshots()).toEqual([expect.objectContaining({ rootSessionId: "root", ownerInstance: "owner", directory: "directory", generation, status: "QUEUED", admissionCount: 1 })])
+	expect(store.syncRuntimeAuthoritative("root", "owner", "IDLE", generation, 105, 10)).toBe(true); expect(store.runtime("root")).toMatchObject({ generation, status: "QUEUED", admissionCount: 1, workPending: true, leaseExpiresMs: 115 }); expect(store.expireRuntimeLeases(116)).toBe(0)
+	expect(store.finishRuntimeAdmission("queued", "root", "owner")).toBe(true); expect(store.activeRuntimeSnapshots()).toEqual([]); expect(store.expireRuntimeLeases(116)).toBe(1); store.close()
+})
+
+test("deactivation atomically cancels owned work and cannot affect reactivation", () => {
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "History" }); store.refreshRoute("recipient", "ctx")
+	store.claimPromptSubmission({ submissionId: "prompt", inboundId: "in", root: "root", owner: "owner", alias: 1, body: "x" }); store.beginRuntimeAdmission("prompt", "root", "owner", 100, 1000); store.markPromptCallStarted("prompt"); store.openNativeRequest({ requestId: "native", requestKey: "native", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} })
+	expect(store.deactivateBinding("root", "owner")).toBe(true); expect(store.bindingForRoot("root")).toMatchObject({ alias: 1, title: "History", active: false }); expect(store.promptSubmission("prompt")).toMatchObject({ state: "UNKNOWN", admissionFinished: true }); expect(store.nativeRequest("native")?.state).toBe("CANCELLED_REMOTE"); expect(store.runtime("root")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.typingDesired()).toBe(false); expect(store.deactivateBinding("root", "owner")).toBe(false)
+	store.bind({ rootSessionId: "root", directory: "new", ownerInstance: "owner", title: "Again" }); store.claimPromptSubmission({ submissionId: "new", inboundId: "new-in", root: "root", owner: "owner", alias: 1, body: "new" }); const generation = store.beginRuntimeAdmission("new", "root", "owner", 200, 1000)!; expect(store.deactivateBinding("root", "other")).toBe(false); expect(store.finishRuntimeAdmission("prompt", "root", "owner")).toBe(true); expect(store.rejectPromptSubmissionNoEffect("prompt", "root", "owner")).toBe(false); expect(store.runtime("root")).toMatchObject({ generation, status: "QUEUED", admissionCount: 1, workPending: true }); store.close()
 })

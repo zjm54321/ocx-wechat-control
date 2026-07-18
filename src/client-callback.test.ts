@@ -67,5 +67,12 @@ test("callbacks reject malformed, oversized, unavailable requests and authentica
 test("runtime-status validates exact roots and normalizes authoritative statuses", async () => {
 	const client = new FakeControlClient(); client.sessions.set("idle", { id: "idle" }); client.sessions.set("retry", { id: "retry" }); client.statuses = { root: { type: "busy" }, retry: { type: "retry", attempt: 1 }, extra: { type: "busy" } }
 	const response = await handler(client)(request("/runtime-status", { rootSessionId: "root", rootSessionIds: ["root", "idle", "retry"], directory: "d" })); expect(response.status).toBe(200); expect(await response.json()).toEqual({ ok: true, statuses: [{ rootSessionId: "root", status: "BUSY" }, { rootSessionId: "idle", status: "IDLE" }, { rootSessionId: "retry", status: "RETRY" }] })
-	const child = await handler(client)(request("/runtime-status", { rootSessionId: "root", rootSessionIds: ["child"], directory: "d" })); expect(child.status).toBe(409)
+	const child = await handler(client)(request("/runtime-status", { rootSessionId: "root", rootSessionIds: ["child"], directory: "d" })); expect(child.status).toBe(409); expect(await child.json()).toMatchObject({ certainty: "REJECTED", error: "not-root" })
+})
+
+test("legacy inject is gone and cannot mutate session state", async () => {
+	let gets = 0, prompts = 0
+	const legacyClient = { session: { get: async () => { gets++; return { data: { id: "root" } } }, prompt: async () => { prompts++; return {} } } }
+	const response = await createCallbackHandler(legacyClient, "secret", "token", new FakeControlClient())(request("/inject", { rootSessionId: "root", directory: "d", inboundId: "in", text: "do not inject", envelope: { kind: "inbound" } }))
+	expect(response.status).toBe(410); expect(await response.json()).toEqual({ error: "legacy-inject-removed" }); expect(gets).toBe(0); expect(prompts).toBe(0)
 })

@@ -85,9 +85,14 @@ export function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex")
 }
 
-export function promptMessageIdForInbound(inboundId: string): string {
-	if (typeof inboundId !== "string" || inboundId.length < 1 || inboundId.length > 500) throw new Error("invalid inbound ID")
-	return `msg_${sha256(inboundId).slice(0, 32)}`
+const ASCENDING_MESSAGE_COUNTER_MAX = 0xfff
+const ASCENDING_MESSAGE_RANDOM_LENGTH = 14
+const ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+function ascendingMessageId(timestamp: number, counter: number): string {
+	const head = ((BigInt(timestamp) << 12n) | BigInt(counter)).toString(16).slice(-12).padStart(12, "0")
+	const bytes = randomBytes(ASCENDING_MESSAGE_RANDOM_LENGTH), suffix = Array.from(bytes, (byte) => ID_ALPHABET[byte % ID_ALPHABET.length]).join("")
+	return `msg_${head}${suffix}`
 }
 
 export function boundedJson(value: unknown, maxLength = MAX_NATIVE_PAYLOAD_LENGTH): string {
@@ -153,6 +158,7 @@ export interface Binding {
 	directory: string
 	ownerInstance: string
 	title: string | null
+	active: boolean
 }
 
 export interface GlobalRoute { conversationId: string | null; contextToken: string | null; updatedAt: string | null }
@@ -305,7 +311,7 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 			if (userVersion < 5 && has("bindings") && columns("bindings").has("conversation_id")) {
 				const conversations = this.db.query("SELECT DISTINCT conversation_id AS id FROM bindings WHERE conversation_id<>''").all() as Array<{ id: string }>
 				this.db.exec("ALTER TABLE bindings RENAME TO bindings_pre_v5")
-				this.db.exec("CREATE TABLE bindings(alias INTEGER PRIMARY KEY AUTOINCREMENT,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)")
+				this.db.exec("CREATE TABLE bindings(alias INTEGER PRIMARY KEY AUTOINCREMENT,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,title TEXT,active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_at TEXT NOT NULL,updated_at TEXT NOT NULL)")
 				this.db.exec("INSERT INTO bindings(alias,root_session_id,directory,owner_instance,title,created_at,updated_at) SELECT alias,root_session_id,directory,owner_instance,NULL,created_at,created_at FROM bindings_pre_v5")
 				this.db.exec("DROP TABLE bindings_pre_v5")
 				this.db.exec("CREATE TABLE IF NOT EXISTS global_route(singleton INTEGER PRIMARY KEY CHECK(singleton=1),conversation_id TEXT,context_token TEXT,updated_at TEXT)")
@@ -324,6 +330,7 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 				this.db.exec("CREATE TABLE IF NOT EXISTS global_route(singleton INTEGER PRIMARY KEY CHECK(singleton=1),conversation_id TEXT,context_token TEXT,updated_at TEXT)")
 				this.db.query("INSERT OR IGNORE INTO global_route(singleton,conversation_id,context_token,updated_at) VALUES(1,NULL,NULL,NULL)").run()
 			}
+			add("bindings", "active", "INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))")
 			if (userVersion > 0 && userVersion < 6) {
 				const now = new Date().toISOString()
 				this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now)
@@ -358,7 +365,7 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 			this.db.query("UPDATE outbound SET state='UNKNOWN',updated_at=? WHERE state='SENDING'").run(new Date().toISOString())
 			this.db.query("UPDATE control_outbound SET state='UNKNOWN',updated_at=? WHERE state='SENDING'").run(new Date().toISOString())
 			this.db.query("UPDATE checkpoints SET state='UNKNOWN',updated_at=? WHERE state IN ('SENDING','ANSWERING')").run(new Date().toISOString())
-			this.db.query("UPDATE prompt_submissions SET state='UNKNOWN',updated_at=? WHERE state='SUBMITTING'").run(now)
+			this.db.query("UPDATE prompt_submissions SET state='UNKNOWN',admission_finished=CASE WHEN admission_generation IS NULL THEN admission_finished ELSE 1 END,updated_at=? WHERE state='SUBMITTING'").run(now)
 			this.db.query("UPDATE native_requests SET state='UNKNOWN',updated_at=? WHERE state='RESOLVING'").run(now)
 			this.db.query("UPDATE native_requests SET state='OPEN',updated_at=? WHERE state='ANNOUNCING'").run(now)
 			this.db.query("UPDATE root_runtime SET admission_count=0,updated_at=?").run(now)
@@ -394,18 +401,33 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 		this.db.transaction(() => {
 			const existing = this.bindingForRoot(input.rootSessionId)
 			if (existing) {
-				if (existing.ownerInstance !== input.ownerInstance && this.instance(existing.ownerInstance)?.online) throw new Error("owner-live")
-				this.db.query("UPDATE bindings SET directory=?,owner_instance=?,title=?,updated_at=? WHERE root_session_id=?").run(input.directory, input.ownerInstance, title, now, input.rootSessionId)
+				if (existing.active && existing.ownerInstance !== input.ownerInstance && this.instance(existing.ownerInstance)?.online) throw new Error("owner-live")
+				this.db.query("UPDATE bindings SET directory=?,owner_instance=?,title=?,active=1,updated_at=? WHERE root_session_id=?").run(input.directory, input.ownerInstance, title, now, input.rootSessionId)
 				if (existing.ownerInstance !== input.ownerInstance) { this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, input.rootSessionId); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,owner_instance=?,updated_at=? WHERE root_session_id=?").run(input.ownerInstance, now, input.rootSessionId); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='owner-rebound',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, input.rootSessionId); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, input.rootSessionId); this.cancelV6Root(input.rootSessionId, input.ownerInstance, now) }
-			} else this.db.query("INSERT INTO bindings(root_session_id,directory,owner_instance,title,created_at,updated_at) VALUES(?,?,?,?,?,?)").run(input.rootSessionId, input.directory, input.ownerInstance, title, now, now)
+			} else this.db.query("INSERT INTO bindings(root_session_id,directory,owner_instance,title,active,created_at,updated_at) VALUES(?,?,?,?,1,?,?)").run(input.rootSessionId, input.directory, input.ownerInstance, title, now, now)
 			this.db.query("UPDATE control_state SET enabled=1,revision=revision+1 WHERE singleton=1 AND enabled=0").run()
 			binding = this.bindingForRoot(input.rootSessionId)
 		})()
 		return binding!
 	}
-	bindingForAlias(alias: number): Binding | undefined { return (this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title FROM bindings WHERE alias=?").get(alias) as Binding | null) ?? undefined }
-	bindingForRoot(root: string): Binding | undefined { return (this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title FROM bindings WHERE root_session_id=?").get(root) as Binding | null) ?? undefined }
-	bindings(): Binding[] { return this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title FROM bindings ORDER BY alias").all() as Binding[] }
+	private bindingRow(row: any): Binding | undefined { return row ? { ...row, active: row.active === 1 } : undefined }
+	bindingForAlias(alias: number): Binding | undefined { return this.bindingRow(this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title,active FROM bindings WHERE alias=?").get(alias)) }
+	bindingForRoot(root: string): Binding | undefined { return this.bindingRow(this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title,active FROM bindings WHERE root_session_id=?").get(root)) }
+	bindings(): Binding[] { return (this.db.query("SELECT alias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title,active FROM bindings WHERE active=1 ORDER BY alias").all() as any[]).map((row) => this.bindingRow(row)!) }
+	deactivateBinding(root: string, owner: string): boolean {
+		return this.db.transaction(() => {
+			const binding = this.bindingForRoot(root)
+			if (!binding?.active || binding.ownerInstance !== owner) return false
+			const now = new Date().toISOString()
+			if (this.db.query("UPDATE bindings SET active=0,updated_at=? WHERE root_session_id=? AND owner_instance=? AND active=1").run(now, root, owner).changes !== 1) return false
+			this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND owner_instance=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, root, owner)
+			this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=? WHERE root_session_id=? AND owner_instance=?").run(now, root, owner)
+			this.db.query("UPDATE inbound SET state='UNKNOWN',reason='binding-deactivated',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, root)
+			this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, root)
+			this.cancelV6Root(root, owner, now)
+			return true
+		})()
+	}
 	refreshRoute(conversationId: string, contextToken: string): void { this.db.query("UPDATE global_route SET conversation_id=?,context_token=?,updated_at=? WHERE singleton=1").run(conversationId, contextToken, new Date().toISOString()) }
 	route(): GlobalRoute { return this.db.query("SELECT conversation_id AS conversationId,context_token AS contextToken,updated_at AS updatedAt FROM global_route WHERE singleton=1").get() as GlobalRoute }
 	acceptInboundRoute(conversationId: string, contextToken: string, allowInitialClaim: boolean): RouteAcceptance {
@@ -433,16 +455,35 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 	private cancelV6Root(root?: string, replacementOwner?: string, now = new Date().toISOString()): void {
 		const where = root ? " AND root_session_id=?" : "", args = root ? [now, root] : [now]
 		this.db.query(`UPDATE native_requests SET state='CANCELLED_REMOTE',updated_at=? WHERE state IN ('ANNOUNCING','OPEN','RESOLVING','UNKNOWN')${where}`).run(...args)
-		this.db.query(`UPDATE prompt_submissions SET state=CASE WHEN call_started=1 THEN 'UNKNOWN' ELSE 'CANCELLED' END,updated_at=? WHERE state='SUBMITTING'${where}`).run(...args)
+		this.db.query(`UPDATE prompt_submissions SET state=CASE WHEN call_started=1 THEN 'UNKNOWN' ELSE 'CANCELLED' END,admission_finished=CASE WHEN admission_generation IS NULL THEN admission_finished ELSE 1 END,updated_at=? WHERE state='SUBMITTING'${where}`).run(...args)
 		if (root) this.db.query("INSERT INTO root_runtime(root_session_id,owner_instance,status,generation,busy_generation,admission_count,work_pending,observed_ms,lease_expires_ms,updated_at) VALUES(?,?,'IDLE',0,NULL,0,0,0,0,?) ON CONFLICT(root_session_id) DO UPDATE SET owner_instance=excluded.owner_instance,status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=0,lease_expires_ms=0,updated_at=excluded.updated_at").run(root, replacementOwner ?? this.bindingForRoot(root)?.ownerInstance ?? "cancelled", now)
 		else this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=0,lease_expires_ms=0,updated_at=?").run(now)
 		this.recomputeTypingDesired(Date.parse(now))
 	}
-	claimPromptSubmission(input: { submissionId: string; inboundId: string; root: string; owner: string; alias: number; messageId: string; body: string; revision?: number }): PromptSubmission | undefined {
-		if (![input.submissionId, input.inboundId, input.root, input.owner, input.messageId].every((value) => typeof value === "string" && value.length > 0 && value.length <= 500) || !Number.isSafeInteger(input.alias) || input.alias < 1 || !isPlainText(input.body)) throw new Error("invalid prompt submission")
-		try { const now = new Date().toISOString(); this.db.query("INSERT INTO prompt_submissions(submission_id,inbound_id,root_session_id,owner_instance,alias,message_id,body,state,call_started,prompt_message_id,rejection,control_revision,admission_generation,admission_finished,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'SUBMITTING',0,NULL,NULL,?,NULL,0,?,?)").run(input.submissionId, input.inboundId, input.root, input.owner, input.alias, input.messageId, input.body, input.revision ?? this.control().revision, now, now) } catch {
+	claimPromptSubmission(input: { submissionId: string; inboundId: string; root: string; owner: string; alias: number; messageId?: string; body: string; revision?: number }): PromptSubmission | undefined {
+		if (![input.submissionId, input.inboundId, input.root, input.owner].every((value) => typeof value === "string" && value.length > 0 && value.length <= 500) || (input.messageId !== undefined && (typeof input.messageId !== "string" || input.messageId.length < 1 || input.messageId.length > 500)) || !Number.isSafeInteger(input.alias) || input.alias < 1 || !isPlainText(input.body)) throw new Error("invalid prompt submission")
+		try { this.db.transaction(() => {
 			const existing = this.promptSubmission(input.submissionId)
-			return existing && existing.inboundId === input.inboundId && existing.rootSessionId === input.root && existing.ownerInstance === input.owner && existing.messageId === input.messageId ? existing : undefined
+			if (existing) {
+				if (existing.inboundId === input.inboundId && existing.rootSessionId === input.root && existing.ownerInstance === input.owner && (input.messageId === undefined || existing.messageId === input.messageId)) return
+				throw new Error("prompt submission identity conflict")
+			}
+			const nowMs = Date.now(), stored = this.db.query("SELECT value FROM meta WHERE key='prompt_message_id_clock'").get() as { value: string } | null
+			let timestamp = nowMs, counter = 0
+			if (stored) {
+				const match = /^(\d+):(\d+)$/.exec(stored.value)
+				if (!match) throw new Error("invalid persisted prompt message ID clock")
+				const previousTimestamp = Number(match[1]), previousCounter = Number(match[2])
+				if (!Number.isSafeInteger(previousTimestamp) || previousTimestamp < 0 || !Number.isInteger(previousCounter) || previousCounter < 0 || previousCounter > ASCENDING_MESSAGE_COUNTER_MAX) throw new Error("invalid persisted prompt message ID clock")
+				if (timestamp <= previousTimestamp) { timestamp = previousTimestamp; counter = previousCounter + 1 }
+				if (counter > ASCENDING_MESSAGE_COUNTER_MAX) { timestamp++; counter = 0 }
+			}
+			const messageId = input.messageId ?? ascendingMessageId(timestamp, counter), now = new Date(nowMs).toISOString()
+			this.db.query("INSERT INTO prompt_submissions(submission_id,inbound_id,root_session_id,owner_instance,alias,message_id,body,state,call_started,prompt_message_id,rejection,control_revision,admission_generation,admission_finished,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'SUBMITTING',0,NULL,NULL,?,NULL,0,?,?)").run(input.submissionId, input.inboundId, input.root, input.owner, input.alias, messageId, input.body, input.revision ?? this.control().revision, now, now)
+			if (input.messageId === undefined) this.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('prompt_message_id_clock',?)").run(`${timestamp}:${counter}`)
+		})() } catch {
+			const existing = this.promptSubmission(input.submissionId)
+			return existing && existing.inboundId === input.inboundId && existing.rootSessionId === input.root && existing.ownerInstance === input.owner && (input.messageId === undefined || existing.messageId === input.messageId) ? existing : undefined
 		}
 		return this.promptSubmission(input.submissionId)
 	}
@@ -512,7 +553,20 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 			if (submission.admissionFinished) return true
 			const now = new Date().toISOString(), finished = this.db.query("UPDATE prompt_submissions SET admission_finished=1,updated_at=? WHERE submission_id=? AND admission_generation=? AND admission_finished=0").run(now, submissionId, submission.admissionGeneration)
 			if (finished.changes !== 1) return false
-			this.db.query("UPDATE root_runtime SET admission_count=admission_count-1,updated_at=? WHERE root_session_id=? AND owner_instance=? AND admission_count>0").run(now, root, owner)
+			this.db.query("UPDATE root_runtime SET admission_count=admission_count-1,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation>=? AND admission_count>0").run(now, root, owner, submission.admissionGeneration)
+			return true
+		})()
+	}
+	rejectPromptSubmissionNoEffect(submissionId: string, root: string, owner: string, rejection?: string): boolean {
+		return this.db.transaction(() => {
+			const submission = this.promptSubmission(submissionId)
+			if (!submission || submission.rootSessionId !== root || submission.ownerInstance !== owner || submission.admissionGeneration === null) return false
+			if (submission.state === "REJECTED" && submission.admissionFinished) return true
+			if (submission.state !== "SUBMITTING") return false
+			const now = new Date().toISOString()
+			if (this.db.query("UPDATE prompt_submissions SET state='REJECTED',rejection=?,admission_finished=1,updated_at=? WHERE submission_id=? AND state='SUBMITTING' AND admission_generation=? AND admission_finished=0").run(rejection?.slice(0, 500) ?? null, now, submissionId, submission.admissionGeneration).changes !== 1) return false
+			this.db.query("UPDATE root_runtime SET admission_count=admission_count-1,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation>=? AND admission_count>0").run(now, root, owner, submission.admissionGeneration)
+			this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,work_pending=0,observed_ms=0,lease_expires_ms=0,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=? AND status='QUEUED' AND admission_count=0").run(now, root, owner, submission.admissionGeneration)
 			return true
 		})()
 	}
@@ -523,7 +577,10 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 	}
 	syncRuntimeAuthoritative(root: string, owner: string, status: "BUSY" | "RETRY" | "QUEUED" | "IDLE", generation: number, now = Date.now(), leaseMs = INSTANCE_TTL_MS): boolean {
 		if (status !== "IDLE") return this.observeRuntimeStatus(root, owner, status, generation, now, leaseMs)
-		return this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=?,lease_expires_ms=?,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=?").run(now, now + leaseMs, new Date(now).toISOString(), root, owner, generation).changes === 1
+		const iso = new Date(now).toISOString()
+		const active = this.db.query("UPDATE root_runtime SET observed_ms=?,lease_expires_ms=?,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=? AND admission_count>0").run(now, now + leaseMs, iso, root, owner, generation)
+		if (active.changes === 1) return true
+		return this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,observed_ms=?,lease_expires_ms=?,updated_at=? WHERE root_session_id=? AND owner_instance=? AND generation=? AND admission_count=0").run(now, now + leaseMs, iso, root, owner, generation).changes === 1
 	}
 	reconcileRuntimeAuthoritative(root: string, owner: string, status: "BUSY" | "RETRY" | "IDLE", now = Date.now(), leaseMs = INSTANCE_TTL_MS): number {
 		const current = this.runtime(root), generation = current?.generation ?? 1, iso = new Date(now).toISOString()
@@ -532,7 +589,10 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 		return generation
 	}
 	runtime(root: string): RootRuntime | undefined { const row = this.db.query("SELECT root_session_id AS rootSessionId,owner_instance AS ownerInstance,status,generation,busy_generation AS busyGeneration,admission_count AS admissionCount,work_pending AS workPending,observed_ms AS observedMs,lease_expires_ms AS leaseExpiresMs FROM root_runtime WHERE root_session_id=?").get(root) as any; return row ? { ...row, workPending: row.workPending === 1 } : undefined }
-	expireRuntimeLeases(now = Date.now()): number { return this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,lease_expires_ms=0,updated_at=? WHERE work_pending=1 AND lease_expires_ms>0 AND lease_expires_ms<=?").run(new Date(now).toISOString(), now).changes }
+	activeRuntimeSnapshots(): Array<RootRuntime & { endpoint: string; instanceToken: string; directory: string }> {
+		return (this.db.query("SELECT r.root_session_id AS rootSessionId,r.owner_instance AS ownerInstance,r.status,r.generation,r.busy_generation AS busyGeneration,r.admission_count AS admissionCount,r.work_pending AS workPending,r.observed_ms AS observedMs,r.lease_expires_ms AS leaseExpiresMs,i.endpoint,i.instance_token AS instanceToken,b.directory FROM root_runtime r JOIN bindings b ON b.root_session_id=r.root_session_id AND b.owner_instance=r.owner_instance AND b.active=1 JOIN instances i ON i.instance_id=r.owner_instance WHERE r.work_pending=1 AND (r.status IN ('BUSY','RETRY') OR (r.status='QUEUED' AND r.admission_count>0))").all() as any[]).map((row) => ({ ...row, workPending: row.workPending === 1 }))
+	}
+	expireRuntimeLeases(now = Date.now()): number { return this.db.query("UPDATE root_runtime SET status='IDLE',generation=generation+1,busy_generation=NULL,admission_count=0,work_pending=0,lease_expires_ms=0,updated_at=? WHERE work_pending=1 AND admission_count=0 AND lease_expires_ms>0 AND lease_expires_ms<=?").run(new Date(now).toISOString(), now).changes }
 	desiredTyping(now = Date.now()): boolean {
 		this.expireRuntimeLeases(now); return this.recomputeTypingDesired(now)
 	}
@@ -542,7 +602,7 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 	setTypingActual(actual: boolean | null, contextHash: string | null, now = Date.now()): void { if (contextHash !== null && contextHash.length > 500) throw new Error("invalid typing context hash"); this.db.query("UPDATE typing_state SET actual=?,context_hash=?,attempt_ms=?,updated_at=? WHERE singleton=1").run(actual === null ? null : actual ? 1 : 0, contextHash, now, new Date(now).toISOString()) }
 	checkpointForRequest(requestKey: string, root?: string): { checkpointId: string; state: string; rootSessionId: string; ownerInstance: string } | undefined { const row = this.db.query("SELECT checkpoint_id AS checkpointId,state,root_session_id AS rootSessionId,owner_instance AS ownerInstance FROM checkpoints WHERE request_key=?").get(requestKey) as { checkpointId: string; state: string; rootSessionId: string; ownerInstance: string } | null; return row && (!root || row.rootSessionId === root) ? row : undefined }
 	openCheckpoint(input: { checkpointId: string; requestKey: string; root: string; owner: string; alias: number; question: string; choices: string[]; revision: number }): boolean {
-		const control = this.control(); if (!control.enabled || control.revision !== input.revision || this.bindingForRoot(input.root)?.ownerInstance !== input.owner) return false
+		const control = this.control(), binding = this.bindingForRoot(input.root); if (!control.enabled || control.revision !== input.revision || !binding?.active || binding.ownerInstance !== input.owner) return false
 		const route = this.route(); if (!route.conversationId) return false
 		if (this.db.query("SELECT 1 FROM checkpoints WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").get(input.root)) return false
 		try { this.db.query("INSERT INTO checkpoints(checkpoint_id,request_key,root_session_id,owner_instance,conversation_id,alias,question,choices_json,state,inbound_id,control_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'SENDING',NULL,?,?,?)").run(input.checkpointId, input.requestKey, input.root, input.owner, route.conversationId, input.alias, input.question, JSON.stringify(input.choices), input.revision, new Date().toISOString(), new Date().toISOString()); return true } catch { return false }
@@ -568,7 +628,7 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 		this.db.query("INSERT INTO session_activity(root_session_id,owner_instance,running,idle,last_assistant_id,last_assistant_error,direct_assistant_id,epoch,run_id,origin,candidate_run,claimed_run,updated_at) VALUES(?,?,1,0,NULL,0,NULL,?,?,'LOCAL',NULL,0,?) ON CONFLICT(root_session_id) DO UPDATE SET owner_instance=excluded.owner_instance,running=1,idle=0,last_assistant_id=NULL,last_assistant_error=0,direct_assistant_id=NULL,epoch=excluded.epoch,run_id=excluded.run_id,origin='LOCAL',candidate_run=NULL,updated_at=excluded.updated_at").run(root, owner, control.revision, run, new Date().toISOString())
 	}
 	claimCompletion(root: string, owner: string): { outboundId: string; binding: RoutedBinding; payload: string } | undefined {
-		const registration = this.bindingForRoot(root), route = this.route(), control = this.control(); if (!control.enabled || !registration || !route.conversationId || !route.contextToken || registration.ownerInstance !== owner) return
+		const registration = this.bindingForRoot(root), route = this.route(), control = this.control(); if (!control.enabled || !registration?.active || !route.conversationId || !route.contextToken || registration.ownerInstance !== owner) return
 		const binding: RoutedBinding = { ...registration, conversationId: route.conversationId, contextToken: route.contextToken }
 		const row = this.db.query("SELECT running,epoch,run_id AS runId,origin,candidate_run AS candidateRun,claimed_run AS claimedRun,idle,last_assistant_id AS assistantId,last_assistant_error AS failed,direct_assistant_id AS directId FROM session_activity WHERE root_session_id=? AND owner_instance=?").get(root, owner) as any
 		if (row?.running && row.idle && row.origin !== "LOCAL") {
@@ -585,7 +645,7 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 		return claimed ? { outboundId, binding, payload } : undefined
 	}
 	claimControlOutbound(input: { dedupeKey: string; root: string; kind: string; payload: string; revision?: number }): { outboundId: string; binding: RoutedBinding } | undefined {
-		const registration = this.bindingForRoot(input.root), route = this.route(), control = this.control(); if (!registration || !route.conversationId || !route.contextToken || !control.enabled || (input.revision !== undefined && input.revision !== control.revision)) return
+		const registration = this.bindingForRoot(input.root), route = this.route(), control = this.control(); if (!registration?.active || !route.conversationId || !route.contextToken || !control.enabled || (input.revision !== undefined && input.revision !== control.revision)) return
 		const binding: RoutedBinding = { ...registration, conversationId: route.conversationId, contextToken: route.contextToken }
 		const outboundId = crypto.randomUUID()
 		try { this.db.query("INSERT INTO control_outbound VALUES(?,?,?,?,'SENDING',?,?,?,?)").run(outboundId, input.dedupeKey, input.root, input.kind, input.payload, binding.conversationId, binding.contextToken, new Date().toISOString()); return { outboundId, binding } } catch { return }
@@ -607,7 +667,7 @@ CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session
 	markUnknown(messageId: string, reason: string): void { this.db.transaction(() => { this.db.query("UPDATE inbound SET state='UNKNOWN',reason=?,updated_at=? WHERE message_id=?").run(reason.slice(0, 200), new Date().toISOString(), messageId); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE inbound_id=? AND state='WAITING'").run(new Date().toISOString(), messageId) })() }
 	completePendingAndClaim(instanceId: string, root: string, inboundId: string, promptMessageId: string, assistantId: string, text: string, revision: number): { binding: RoutedBinding; payload: string; revision: number } | undefined {
 		const registration = this.bindingForRoot(root), route = this.route()
-		const control = this.control(); if (!registration || registration.ownerInstance !== instanceId || !route.conversationId || !route.contextToken || !control.enabled || control.revision !== revision) return
+		const control = this.control(); if (!registration?.active || registration.ownerInstance !== instanceId || !route.conversationId || !route.contextToken || !control.enabled || control.revision !== revision) return
 		const binding: RoutedBinding = { ...registration, conversationId: route.conversationId, contextToken: route.contextToken }
 		const payload = formatOutbound(binding.alias, text)
 		let claimed = false

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { MockWeChatAdapter } from "./adapter"
 import { BrokerService, parseQuestionAnswers, type NativeQuestionPayload } from "./broker"
-import { Store, promptMessageIdForInbound } from "./core"
+import { Store } from "./core"
 
 type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
 
@@ -32,7 +32,7 @@ test("same-root admissions serialize only callback admission and never send assi
 	const releases: Array<(response: Response) => void> = [], calls: Array<Record<string, unknown>> = []
 	const { store, adapter, broker } = flow(async (_url, init) => { calls.push(JSON.parse(String(init?.body))); return new Promise<Response>((resolve) => releases.push(resolve)) })
 	const first = broker.handleInbound(inbound("first", 1, "one")); await Bun.sleep(0); const second = broker.handleInbound(inbound("second", 1, "two")); await Bun.sleep(0)
-	expect(calls).toHaveLength(1); expect(calls[0]).toMatchObject({ inboundId: "first", messageId: promptMessageIdForInbound("first"), text: "one" })
+	expect(calls).toHaveLength(1); expect(calls[0]).toMatchObject({ inboundId: "first", messageId: store.promptSubmission("first")?.messageId, text: "one" }); expect(calls[0].messageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
 	releases[0](Response.json({ ok: true, accepted: true })); expect((await first).ok).toBe(true); await Bun.sleep(0); expect(calls).toHaveLength(2); releases[1](Response.json({ ok: true, accepted: true })); expect((await second).ok).toBe(true)
 	expect(store.promptSubmission("first")?.state).toBe("SUBMITTED"); expect(store.promptSubmission("second")?.state).toBe("SUBMITTED"); expect(adapter.sent).toHaveLength(0); expect((store.db.query("SELECT COUNT(*) AS count FROM pending_replies").get() as { count: number }).count).toBe(0); store.close()
 })
@@ -47,8 +47,49 @@ test("different roots admit in parallel and duplicate inbound never resubmits", 
 test("prompt rejection and uncertainty map to durable terminal states without replay", async () => {
 	let mode: "reject" | "throw" = "reject", calls = 0
 	const { store, broker } = flow(async () => { calls++; if (mode === "throw") throw new DOMException("timeout", "TimeoutError"); return Response.json({ ok: false, certainty: "REJECTED", error: "not-root" }, { status: 409 }) })
-	expect((await broker.handleInbound(inbound("rejected", 1, "x"))).reason).toBe("prompt-rejected"); expect(store.promptSubmission("rejected")?.state).toBe("REJECTED")
-	mode = "throw"; expect((await broker.handleInbound(inbound("unknown", 1, "y"))).reason).toBe("unknown-no-replay"); expect(store.promptSubmission("unknown")?.state).toBe("UNKNOWN"); await broker.handleInbound(inbound("unknown", 1, "y")); expect(calls).toBe(2); store.close()
+	expect((await broker.handleInbound(inbound("rejected", 1, "x"))).reason).toBe("prompt-rejected"); expect(store.promptSubmission("rejected")?.state).toBe("REJECTED"); expect(store.bindingForRoot("root")?.active).toBe(false)
+	store.bind({ rootSessionId: "root", directory: "d-root", ownerInstance: "owner" }); mode = "throw"; expect((await broker.handleInbound(inbound("unknown", 1, "y"))).reason).toBe("unknown-no-replay"); expect(store.promptSubmission("unknown")?.state).toBe("UNKNOWN"); await broker.handleInbound(inbound("unknown", 1, "y")); expect(calls).toBe(2); store.close()
+})
+
+test("maintenance renews authoritative busy and applies idle", async () => {
+	let status: "BUSY" | "IDLE" = "BUSY", calls = 0
+	const { store, broker } = flow(async (url, init) => { if (String(url).endsWith("/runtime-status")) { calls++; expect((JSON.parse(String(init?.body)) as any).rootSessionIds).toEqual(["root"]); return Response.json({ ok: true, statuses: [{ rootSessionId: "root", status }] }) }; return Response.json({ ok: true }) })
+	store.claimPromptSubmission({ submissionId: "one", inboundId: "one-in", root: "root", owner: "owner", alias: 1, body: "one" }); const generation = store.beginRuntimeAdmission("one", "root", "owner", 100, 10)!; store.finishRuntimeAdmission("one", "root", "owner"); store.observeRuntimeStatus("root", "owner", "BUSY", generation, 100, 10)
+	await broker.reconcileActiveRuntimes(105, 10); expect(store.runtime("root")).toMatchObject({ status: "BUSY", leaseExpiresMs: 115 }); expect(store.expireRuntimeLeases(111)).toBe(0); status = "IDLE"; await broker.reconcileActiveRuntimes(112, 10); expect(store.runtime("root")).toMatchObject({ status: "IDLE", workPending: false }); expect(calls).toBe(2); store.close()
+})
+
+test("maintenance isolates batch not-root and renews the remaining root", async () => {
+	const calls: string[][] = [], { store, broker } = flow(async (url, init) => {
+		if (!String(url).endsWith("/runtime-status")) return Response.json({ ok: true })
+		const roots = (JSON.parse(String(init?.body)) as { rootSessionIds: string[] }).rootSessionIds; calls.push(roots)
+		if (roots.length > 1 || roots[0] === "a") return Response.json({ error: "not-root" }, { status: 409 })
+		return Response.json({ ok: true, statuses: [{ rootSessionId: "b", status: "BUSY" }] })
+	}, ["a", "b"])
+	store.bind({ rootSessionId: "a", directory: "shared", ownerInstance: "owner" }); store.bind({ rootSessionId: "b", directory: "shared", ownerInstance: "owner" })
+	for (const [root, alias] of [["a", 1], ["b", 2]] as const) { const id = `${root}-prompt`; store.claimPromptSubmission({ submissionId: id, inboundId: `${id}-in`, root, owner: "owner", alias, body: root }); const generation = store.beginRuntimeAdmission(id, root, "owner", 100, 10)!; store.finishRuntimeAdmission(id, root, "owner"); store.observeRuntimeStatus(root, "owner", "BUSY", generation, 100, 10) }
+	await broker.reconcileActiveRuntimes(105, 20)
+	expect(calls).toEqual([["a", "b"], ["a"], ["b"]]); expect(store.bindingForRoot("a")?.active).toBe(false); expect(store.runtime("a")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.bindingForRoot("b")?.active).toBe(true); expect(store.runtime("b")).toMatchObject({ status: "BUSY", leaseExpiresMs: 125 }); store.close()
+})
+
+test("maintenance isolates malformed batch and per-root network failure", async () => {
+	const calls: string[][] = [], { store, broker } = flow(async (url, init) => {
+		if (!String(url).endsWith("/runtime-status")) return Response.json({ ok: true })
+		const roots = (JSON.parse(String(init?.body)) as { rootSessionIds: string[] }).rootSessionIds; calls.push(roots)
+		if (roots.length > 1) return Response.json({ ok: true, statuses: "malformed" })
+		if (roots[0] === "a") throw new DOMException("timeout", "TimeoutError")
+		return Response.json({ ok: true, statuses: [{ rootSessionId: "b", status: "BUSY" }] })
+	}, ["a", "b"])
+	store.bind({ rootSessionId: "a", directory: "shared", ownerInstance: "owner" }); store.bind({ rootSessionId: "b", directory: "shared", ownerInstance: "owner" })
+	for (const [root, alias] of [["a", 1], ["b", 2]] as const) { const id = `${root}-prompt`; store.claimPromptSubmission({ submissionId: id, inboundId: `${id}-in`, root, owner: "owner", alias, body: root }); const generation = store.beginRuntimeAdmission(id, root, "owner", 100, 10)!; store.finishRuntimeAdmission(id, root, "owner"); store.observeRuntimeStatus(root, "owner", "BUSY", generation, 100, 10) }
+	await broker.reconcileActiveRuntimes(105, 20)
+	expect(calls).toEqual([["a", "b"], ["a"], ["b"]]); expect(store.bindingForRoot("a")?.active).toBe(true); expect(store.runtime("a")).toMatchObject({ status: "BUSY", leaseExpiresMs: 110 }); expect(store.runtime("b")).toMatchObject({ status: "BUSY", leaseExpiresMs: 125 }); store.close()
+})
+
+test("maintenance discards authoritative status after generation changes in flight", async () => {
+	let release!: (response: Response) => void, entered!: () => void; const pending = new Promise<Response>((resolve) => release = resolve), started = new Promise<void>((resolve) => entered = resolve)
+	const { store, broker } = flow(async (url) => { if (String(url).endsWith("/runtime-status")) { entered(); return pending }; return Response.json({ ok: true }) })
+	store.claimPromptSubmission({ submissionId: "one", inboundId: "one-in", root: "root", owner: "owner", alias: 1, body: "one" }); const one = store.beginRuntimeAdmission("one", "root", "owner", 100, 10)!; store.finishRuntimeAdmission("one", "root", "owner"); store.observeRuntimeStatus("root", "owner", "BUSY", one, 100, 10)
+	const maintenance = broker.reconcileActiveRuntimes(105, 10); await started; store.claimPromptSubmission({ submissionId: "two", inboundId: "two-in", root: "root", owner: "owner", alias: 1, body: "two" }); const two = store.beginRuntimeAdmission("two", "root", "owner", 106, 10)!; release(Response.json({ ok: true, statuses: [{ rootSessionId: "root", status: "IDLE" }] })); await maintenance; expect(store.runtime("root")).toMatchObject({ generation: two, status: "BUSY", workPending: true }); store.close()
 })
 
 test("zero one and multiple native precedence never accidentally prompts", async () => {

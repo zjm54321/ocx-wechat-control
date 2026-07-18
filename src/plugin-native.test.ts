@@ -13,7 +13,17 @@ test("native event hook relays guarded question and permission events and termin
 
 test("native event hook ignores malformed payloads and preserves permission ask", async () => {
 	const calls: unknown[] = [], hook = createControlEventHook(async () => { calls.push(true); return {} }, "e", "s", "instance", "token", async () => "root")
-	await hook({ event: { type: "permission.asked", properties: { sessionID: "child", id: "p", permission: 1 } } }); await hook({ event: { type: "question.asked", properties: { sessionID: "child", id: "q", questions: "bad" } } }); expect(calls).toHaveLength(0)
+	await hook({ event: { type: "permission.asked", properties: { sessionID: "child", id: "p", permission: 1 } } }); await hook({ event: { type: "question.asked", properties: { sessionID: "child", id: "q", questions: "bad" } } }); await hook({ event: { type: "permission.replied", properties: { sessionID: "child", requestID: "p", reply: "invalid" } } }); expect(calls).toHaveLength(0)
+})
+
+test("permission.replied maps reject and once to native terminal states", async () => {
+	const calls: object[] = [], hook = createControlEventHook(async (_endpoint, _secret, body) => { calls.push(body); return {} }, "e", "s", "instance", "token", async () => "root")
+	await hook({ event: { type: "permission.replied", properties: { sessionID: "child", requestID: "p-reject", reply: "reject" } } })
+	await hook({ event: { type: "permission.replied", properties: { sessionID: "child", requestID: "p-once", reply: "once" } } })
+	expect(calls).toEqual([
+		{ method: "native-request-terminal", instanceId: "instance", instanceToken: "token", rootSessionId: "root", requestId: "p-reject", state: "REJECTED", resolution: "reject" },
+		{ method: "native-request-terminal", instanceId: "instance", instanceToken: "token", rootSessionId: "root", requestId: "p-once", state: "RESOLVED", resolution: "once" },
+	])
 })
 
 test("production event-hook factory resolves child sessions for open and terminal RPCs", async () => {

@@ -1,8 +1,9 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import * as path from "node:path"
 import { makeRpcRequest } from "./broker"
+import { WORKER_CAPABILITIES, WORKER_PACKAGE_VERSION, WORKER_PROTOCOL_VERSION, WORKER_SCHEMA_VERSION, type WorkerMetadata } from "./worker-protocol"
 
-export interface LockMetadata { pid: number; startedAt: string; workerToken: string; endpoint: string; heartbeat: string; format?: "v1" | "v2" }
+export interface LockMetadata extends Partial<WorkerMetadata> { pid: number; startedAt: string; workerToken: string; endpoint: string; heartbeat: string; format?: "v1" | "v2" }
 export type ExistingDecision = "connect" | "refuse" | "takeover"
 export type PidStatus = "alive" | "dead" | "unknown"
 
@@ -23,15 +24,36 @@ export async function readLock(directory: string): Promise<LockMetadata | undefi
 		const value = JSON.parse(await readFile(path.join(directory, "broker.lock", "owner.json"), "utf8"))
 		const workerToken = typeof value.workerToken === "string" ? value.workerToken : typeof value.instanceToken === "string" ? value.instanceToken : undefined
 		if (!Number.isSafeInteger(value.pid) || !workerToken || typeof value.endpoint !== "string") return
-		return { pid: value.pid, startedAt: String(value.startedAt ?? ""), workerToken, endpoint: value.endpoint, heartbeat: String(value.heartbeat ?? ""), format: typeof value.workerToken === "string" ? "v2" : "v1" }
+		return { ...value, pid: value.pid, startedAt: String(value.startedAt ?? ""), workerToken, endpoint: value.endpoint, heartbeat: String(value.heartbeat ?? ""), format: typeof value.workerToken === "string" ? "v2" : "v1" }
 	} catch { return }
 }
 
-export async function authenticatedHealth(metadata: LockMetadata, secret: string): Promise<boolean> {
-	if (!metadata.endpoint.startsWith("http://127.0.0.1:")) return false
-	try { const response = await makeRpcRequest(metadata.endpoint, secret, { method: "health", challenge: metadata.workerToken }); const body = await response.json() as any; return response.ok && body.challenge === metadata.workerToken }
-	catch { return false }
+function stringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every((item) => typeof item === "string") }
+
+export function workerCompatibilityIssue(lock: LockMetadata, health: unknown): string | undefined {
+	if (!health || typeof health !== "object" || Array.isArray(health)) return "missing health metadata"
+	const value = health as Record<string, unknown>
+	if (value.packageVersion !== WORKER_PACKAGE_VERSION || lock.packageVersion !== WORKER_PACKAGE_VERSION) return `package version mismatch (expected ${WORKER_PACKAGE_VERSION})`
+	if (value.protocolVersion !== WORKER_PROTOCOL_VERSION || lock.protocolVersion !== WORKER_PROTOCOL_VERSION) return `protocol version mismatch (expected ${WORKER_PROTOCOL_VERSION})`
+	if (value.schemaVersion !== WORKER_SCHEMA_VERSION || lock.schemaVersion !== WORKER_SCHEMA_VERSION) return `schema version mismatch (expected ${WORKER_SCHEMA_VERSION})`
+	const healthCapabilities = value.capabilities, lockCapabilities = lock.capabilities
+	if (!stringArray(healthCapabilities) || !stringArray(lockCapabilities) || WORKER_CAPABILITIES.some((capability) => !healthCapabilities.includes(capability) || !lockCapabilities.includes(capability))) return "required worker capabilities missing"
+	if (value.workerPid !== lock.pid || lock.workerPid !== lock.pid) return "worker PID metadata mismatch"
+	if (typeof value.workerEntrypoint !== "string" || !value.workerEntrypoint || value.workerEntrypoint !== lock.workerEntrypoint) return "worker entrypoint metadata mismatch"
+	if (!stringArray(value.adapterCommand) || !stringArray(lock.adapterCommand) || JSON.stringify(value.adapterCommand) !== JSON.stringify(lock.adapterCommand)) return "adapter command metadata mismatch"
+	if (!value.adapterProvenance || typeof value.adapterProvenance !== "object" || JSON.stringify(value.adapterProvenance) !== JSON.stringify(lock.adapterProvenance)) return "adapter provenance metadata mismatch"
 }
+
+export async function authenticatedWorkerHealth(metadata: LockMetadata, secret: string): Promise<{ body?: Record<string, unknown>; issue?: string; authenticated: boolean }> {
+	if (!metadata.endpoint.startsWith("http://127.0.0.1:")) return { authenticated: false }
+	try {
+		const response = await makeRpcRequest(metadata.endpoint, secret, { method: "health", challenge: metadata.workerToken }), body = await response.json() as Record<string, unknown>
+		if (!response.ok || body.challenge !== metadata.workerToken) return { authenticated: false }
+		return { authenticated: true, body, issue: workerCompatibilityIssue(metadata, body) }
+	} catch { return { authenticated: false } }
+}
+
+export async function authenticatedHealth(metadata: LockMetadata, secret: string): Promise<boolean> { const result = await authenticatedWorkerHealth(metadata, secret); return result.authenticated && !result.issue }
 
 export async function acquireWorkerLock(directory: string, secret: string, initial: LockMetadata): Promise<{ update(value: LockMetadata): Promise<void>; release(): Promise<void> }> {
 	const lock = path.join(directory, "broker.lock"), owner = path.join(lock, "owner.json")

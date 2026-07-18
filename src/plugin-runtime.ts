@@ -1,7 +1,9 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import { ClientLifecycleRegistry, connectOrStartWorker, resolveRootSession, rpc, startV2CallbackServer, type CallbackServer, type ClientLifecycle } from "./client"
+import { makeRpcRequest } from "./broker"
 import { sanitizeTitle, SerialQueue, sha256 } from "./core"
 import { createRequire } from "node:module"
+import { HttpServerResponse } from "effect/unstable/http"
 
 export function resolveWeixinCommand(value: unknown): string[] {
 	if (value === undefined) return ["node", createRequire(import.meta.url).resolve("weixin-mcp/dist/cli.js")]
@@ -10,15 +12,39 @@ export function resolveWeixinCommand(value: unknown): string[] {
 }
 const LEAVE_SENTINEL = "__WECHAT_CONTROL_LEAVE_HANDLED__", BACK_SENTINEL = "__WECHAT_CONTROL_BACK_HANDLED__"
 const CONTROL_COMMANDS = { leave: { template: LEAVE_SENTINEL, description: "启用受限微信接管" }, back: { template: BACK_SENTINEL, description: "关闭受限微信接管" } } as const
-const registry = new ClientLifecycleRegistry()
-let exitHandlersInstalled = false
+const LIFECYCLE_SYMBOL = Symbol.for("ocx-wechat-control.plugin-lifecycle.v1")
+type LifecycleContainer = { version: 1; registry: ClientLifecycleRegistry; exitHandlersInstalled: boolean; exitHandlers?: Partial<Record<"beforeExit" | "SIGINT" | "SIGTERM", () => void>> }
+const lifecycleGlobal = globalThis as typeof globalThis & Record<symbol, unknown>
+const existingLifecycle = lifecycleGlobal[LIFECYCLE_SYMBOL] as Partial<LifecycleContainer> | undefined
+const lifecycle: LifecycleContainer = existingLifecycle?.version === 1 && existingLifecycle.registry !== undefined
+	? existingLifecycle as LifecycleContainer
+	: { version: 1, registry: new ClientLifecycleRegistry(), exitHandlersInstalled: false }
+lifecycleGlobal[LIFECYCLE_SYMBOL] = lifecycle
+const registry = lifecycle.registry
 async function stopAll(): Promise<void> { await registry.stopAll() }
-function installExitHandlers(): void { if (exitHandlersInstalled) return; exitHandlersInstalled = true; process.once("beforeExit", () => { void stopAll() }); process.once("SIGINT", () => { void stopAll() }); process.once("SIGTERM", () => { void stopAll() }) }
+function installExitHandlers(): void {
+	if (lifecycle.exitHandlersInstalled) return
+	lifecycle.exitHandlersInstalled = true
+	const exitHandlers = { beforeExit: () => { void stopAll() }, SIGINT: () => { void stopAll() }, SIGTERM: () => { void stopAll() } }
+	lifecycle.exitHandlers = exitHandlers
+	process.once("beforeExit", exitHandlers.beforeExit)
+	process.once("SIGINT", exitHandlers.SIGINT)
+	process.once("SIGTERM", exitHandlers.SIGTERM)
+}
 export function lifecycleRegistrySize(): number { return registry.size() }
+export const pluginLifecycleTestHooks = {
+	registry,
+	installExitHandlers,
+	exitHandlersInstalled: () => lifecycle.exitHandlersInstalled,
+	reset: async () => {
+		await registry.stopAll()
+		if (lifecycle.exitHandlers) for (const [event, handler] of Object.entries(lifecycle.exitHandlers)) process.removeListener(event, handler)
+		lifecycle.exitHandlers = undefined
+		lifecycle.exitHandlersInstalled = false
+	},
+}
 
 export function startPluginCallbackServer(client: Parameters<typeof startV2CallbackServer>[0], serverUrl: URL, directory: string, sharedSecret: string, instanceToken: string): CallbackServer { return startV2CallbackServer(client, serverUrl, directory, sharedSecret, instanceToken) }
-
-export class ControlCommandHandled extends Error { constructor(message: string) { super(message); this.name = "WechatControlCommandHandled" } }
 
 export function registerControlCommands(config: any): void {
 	config.command ??= {}
@@ -32,7 +58,7 @@ export function createControlCommandHook(rpcCall: typeof rpc, toast: (enabled: b
 	return async (input: { command: string; arguments: string; sessionID?: string }, output: { parts: unknown[] }) => {
 		if (input.command !== "leave" && input.command !== "back") return
 		output.parts.splice(0)
-		if (input.arguments.trim()) throw new ControlCommandHandled(`/${input.command} 不接受参数。`)
+		if (input.arguments.trim()) throw HttpServerResponse.jsonUnsafe({ error: `/${input.command} does not accept arguments` }, { status: 400 })
 		const enabled = input.command === "leave"
 		let alias: number | undefined
 		try {
@@ -44,9 +70,12 @@ export function createControlCommandHook(rpcCall: typeof rpc, toast: (enabled: b
 				alias = result.binding.alias
 			} else await rpcCall(endpoint, secret, { method: "back-global", instanceId, instanceToken })
 		}
-		catch { throw new ControlCommandHandled("微信接管状态更新失败；命令已拦截，未发送给模型。") }
+		catch { throw HttpServerResponse.jsonUnsafe({ error: "wechat control command failed before model admission" }, { status: 503 }) }
 		try { await toast(enabled, alias) } catch {}
-		throw new ControlCommandHandled(enabled ? `已登记 #${alias}，微信输入 id 可查看会话。` : "受限微信接管已关闭。")
+		// OpenCode 1.18.3 has no command-hook cancellation result. Its Effect HTTP
+		// boundary treats this response as the completed request, before prompt()
+		// can create a message or call a model.
+		throw HttpServerResponse.empty({ status: 204, headers: { "x-ocx-command": enabled ? `leave:${alias}` : "back" } })
 	}
 }
 
@@ -76,9 +105,11 @@ export function createControlEventHook(rpcCall: typeof rpc, endpoint: string, se
 					if (!validEventText(id, 500) || (event.type === "question.asked" && !Array.isArray(properties?.questions)) || (event.type === "permission.asked" && !validEventText(properties?.permission, 500))) return
 					await rpcCall(endpoint, secret, { method: "native-request-open", ...auth, rootSessionId, requestId: id, requestKey, kind: event.type === "question.asked" ? "QUESTION" : "PERMISSION", payload })
 				} else if (event.type === "question.replied" || event.type === "question.rejected" || event.type === "permission.replied" || event.type === "permission.rejected") {
-					const id = properties?.requestID ?? properties?.id, terminal = event.type.endsWith("rejected") ? "REJECTED" : "RESOLVED"
+					const id = properties?.requestID ?? properties?.id, reply = properties?.reply
+					if (event.type === "permission.replied" && reply !== "once" && reply !== "always" && reply !== "reject") return
+					const terminal = event.type.endsWith("rejected") || (event.type === "permission.replied" && reply === "reject") ? "REJECTED" : "RESOLVED"
 					if (!validEventText(id, 500)) return
-					await rpcCall(endpoint, secret, { method: "native-request-terminal", ...auth, rootSessionId, requestId: id, state: terminal, resolution: properties?.answers ?? properties?.reply })
+					await rpcCall(endpoint, secret, { method: "native-request-terminal", ...auth, rootSessionId, requestId: id, state: terminal, resolution: properties?.answers ?? reply })
 				}
 			} catch {}
 		})
@@ -91,6 +122,16 @@ export async function requestInputToolOutcome(action: () => Promise<any>): Promi
 	try { const result = await action(); if (result.unknown || result.state === "UNKNOWN") return "检查点发送结果未知。禁止重复发送；请立即结束本回合。" }
 	catch { return "检查点未能确认。禁止重复发送；请立即结束本回合。" }
 	return "检查点已异步发送。不要等待或猜测微信答案；请立即结束本回合。答案将作为一个新的用户 turn 注入。"
+}
+
+type RpcRequest = (endpoint: string, secret: string, body: object, timeoutMs?: number) => Promise<Response>
+export async function wechatReplyRpc(endpoint: string, secret: string, body: object, request: RpcRequest = makeRpcRequest): Promise<any> {
+	const response = await request(endpoint, secret, body)
+	const value = await response.json() as any
+	if (response.ok) return value
+	const keys = value !== null && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : []
+	if (response.status === 409 && keys.length === 3 && value.ok === false && value.state === "UNKNOWN" && value.replayed === false) return value
+	throw new Error(value?.error || "broker RPC failed")
 }
 
 export function captureReplyCallID(input: any, output: any): void { if (input.tool === "wechat_reply" && typeof input.callID === "string" && output.args && typeof output.args === "object") output.args.__wechatCallID = input.callID }
@@ -123,7 +164,7 @@ export const WeChatControlPlugin: Plugin = async ({ client, directory, serverUrl
 		"command.execute.before": commandHook,
 		"tool.execute.before": async (input: any, output: any) => { captureReplyCallID(input, output) },
 		tool: {
-			wechat_reply: tool({ description: "Send text to the bound WeChat conversation. The call is durably deduplicated by tool call ID and never retries an unknown send.", args: { text: tool.schema.string().min(1).max(4000), __wechatCallID: tool.schema.string().max(500).optional() }, async execute(args, context) { const rootSessionId = await root(context.sessionID), callId = args.__wechatCallID ?? context.messageID; const result = await rpc(worker.endpoint, worker.secret, { method: "wechat-reply", ...auth, rootSessionId, callId, text: args.text }); return result.state === "UNKNOWN" ? "微信回复发送结果未知；禁止重复发送。" : result.ok ? "已发送。" : "微信回复未发送。" } }),
+			wechat_reply: tool({ description: "Send text to the bound WeChat conversation. The call is durably deduplicated by tool call ID and never retries an unknown send.", args: { text: tool.schema.string().min(1).max(4000), __wechatCallID: tool.schema.string().max(500).optional() }, async execute(args, context) { const rootSessionId = await root(context.sessionID), callId = args.__wechatCallID ?? context.messageID; const result = await wechatReplyRpc(worker.endpoint, worker.secret, { method: "wechat-reply", ...auth, rootSessionId, callId, text: args.text }); return result.state === "UNKNOWN" ? "微信回复发送结果未知；禁止重复发送。" : result.ok ? "已发送。" : "微信回复未发送。" } }),
 			wechat_send_text: tool({ description: "Restricted compatibility tool; arbitrary/manual sends are disabled.", args: { text: tool.schema.string().min(1).max(4000) }, async execute() { return "拒绝：仅允许受限接管状态机产生的固定或关联外发。" } }),
 			wechat_control_status: tool({ description: "Report registration, global route and takeover state without sending or polling.", args: {}, async execute(_args, context) { const rootSessionId = await root(context.sessionID); const status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); return `broker=Ready adapter=${status.adapter} takeover=${status.enabled ? "on" : "off"} registered=${status.registered} alias=${status.alias ?? "none"} route=${status.routeReady ? "ready" : "missing"}` } }),
 		},

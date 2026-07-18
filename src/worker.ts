@@ -5,6 +5,7 @@ import { BrokerService } from "./broker"
 import { Store, initializeState } from "./core"
 import { acquireWorkerLock, type LockMetadata } from "./worker-runtime"
 import { TypingCoordinator } from "./typing"
+import { createWorkerMetadata, type WorkerMetadata } from "./worker-protocol"
 
 export interface WorkerConfig { enabled: true; weixinCommand: string[] }
 export interface WorkerDependencies {
@@ -12,7 +13,7 @@ export interface WorkerDependencies {
 	acquireLock: typeof acquireWorkerLock
 	createStore(databasePath: string): Store
 	createAdapter(config: WorkerConfig): WeChatAdapter
-	createBroker(store: Store, adapter: WeChatAdapter, secret: string, token: string, typing?: TypingCoordinator): BrokerService
+	createBroker(store: Store, adapter: WeChatAdapter, secret: string, token: string, typing: TypingCoordinator | undefined, metadata: WorkerMetadata): BrokerService
 	createTyping?(store: Store): TypingCoordinator
 	waitForShutdown(): Promise<void>
 }
@@ -31,33 +32,55 @@ export async function runWorker(config: WorkerConfig, overrides: Partial<WorkerD
 		createStore: (databasePath) => new Store(databasePath),
 		createAdapter: (value) => new WeixinMcpAdapter({ enabled: value.enabled, command: value.weixinCommand }),
 		createTyping: (store) => new TypingCoordinator(store),
-		createBroker: (store, adapter, secret, token, typing) => new BrokerService(store, adapter, secret, token, fetch, { typing }),
+		createBroker: (store, adapter, secret, token, typing, workerMetadata) => new BrokerService(store, adapter, secret, token, fetch, { typing, workerMetadata }),
 		waitForShutdown: () => new Promise<void>((resolve) => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); process.once("beforeExit", resolve) }),
 	}
 	const deps = { ...defaults, ...overrides }
 	const state = await deps.initializeState(), workerToken = crypto.randomUUID(), startedAt = new Date().toISOString()
-	const initial: LockMetadata = { pid: process.pid, startedAt, workerToken, endpoint: "pending", heartbeat: startedAt }
+	const workerMetadata = createWorkerMetadata(process.pid, path.resolve(process.argv[1] ?? import.meta.path), config.weixinCommand)
+	const initial: LockMetadata = { pid: process.pid, startedAt, workerToken, endpoint: "pending", heartbeat: startedAt, ...workerMetadata }
 	let lock: Awaited<ReturnType<typeof acquireWorkerLock>> | undefined
 	let store: Store | undefined
 	let adapter: WeChatAdapter | undefined
 	let broker: BrokerService | undefined
 	let typing: TypingCoordinator | undefined
 	let heartbeat: Timer | undefined
+	let maintenance: Promise<void> | undefined
+	let shuttingDown = false
 	try {
 		lock = await deps.acquireLock(state.directory, state.secret, initial)
 		store = deps.createStore(path.join(state.directory, "state.sqlite"))
 		adapter = deps.createAdapter(config)
 		typing = deps.createTyping?.(store)
-		broker = deps.createBroker(store, adapter, state.secret, workerToken, typing)
+		broker = deps.createBroker(store, adapter, state.secret, workerToken, typing, workerMetadata)
 		const endpoint = broker.start()
 		await lock.update({ ...initial, endpoint, heartbeat: new Date().toISOString() })
 		await broker.startAdapter()
 		if (typing) await typing.startup()
-		const update = () => { store?.sweepOrphanWaiting(); store?.sweepOutboundEchoes(); store?.expireRuntimeLeases(); typing?.refresh(); return lock!.update({ ...initial, endpoint, heartbeat: new Date().toISOString() }).catch(() => {}) }
-		await update(); heartbeat = setInterval(update, 15_000)
+		const update = (): Promise<void> => {
+			if (shuttingDown) return Promise.resolve()
+			if (maintenance) return maintenance
+			const current = (async () => {
+				try {
+					store?.sweepOrphanWaiting()
+					store?.sweepOutboundEchoes()
+					if (typeof broker?.reconcileActiveRuntimes === "function") await broker.reconcileActiveRuntimes()
+					if (shuttingDown) return
+					store?.expireRuntimeLeases()
+					typing?.refresh()
+					await lock!.update({ ...initial, endpoint, heartbeat: new Date().toISOString() }).catch(() => {})
+				} catch {}
+			})()
+			maintenance = current
+			void current.then(() => { if (maintenance === current) maintenance = undefined })
+			return current
+		}
+		await update(); heartbeat = setInterval(() => { void update() }, 15_000)
 		await deps.waitForShutdown()
 	} finally {
+		shuttingDown = true
 		if (heartbeat) clearInterval(heartbeat)
+		await maintenance?.catch(() => {})
 		try { await typing?.shutdown() } catch {}
 		try { if (broker) broker.stop(); else adapter?.stop() } catch {}
 		try { store?.close() } catch {}

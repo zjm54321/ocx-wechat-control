@@ -47,6 +47,7 @@ const MAX_ROOT_STATUS_COUNT = 64
 const MAX_QUESTIONS = 32
 const MAX_ANSWERS_PER_QUESTION = 32
 const MAX_ANSWER_LENGTH = 1000
+const WECHAT_PROMPT_SYSTEM = "This turn came from the bound WeChat conversation. After composing your answer, you must call wechat_reply({text}) with the answer. Do not leave the answer only in the TUI."
 
 type JsonObject = Record<string, unknown>
 type LegacyCallbackClient = { session: { get(input: unknown): Promise<unknown>; prompt(input: unknown): Promise<unknown> } }
@@ -114,17 +115,18 @@ function normalizedStatus(value: unknown): "IDLE" | "BUSY" | "RETRY" | "UNKNOWN"
 	return type === "idle" ? "IDLE" : type === "busy" ? "BUSY" : type === "retry" ? "RETRY" : "UNKNOWN"
 }
 
-async function handleV2Callback(pathname: string, request: Request, client: V2ControlClient): Promise<Response> {
+async function handleV2Callback(pathname: string, request: Request, client: V2ControlClient, callbackDirectory: string): Promise<Response> {
 	const body = await boundedBody(request)
 	if (!body) return rejected("bad-request")
 	const rootSessionId = body.rootSessionId, directory = body.directory
 	if (!boundedString(rootSessionId) || !boundedString(directory, MAX_DIRECTORY_LENGTH)) return rejected("bad-request")
+	if (directory !== callbackDirectory) return rejected("directory-mismatch", 409)
 
 	if (pathname === "/submit-prompt") {
 		if (!boundedString(body.inboundId) || !boundedString(body.messageId) || typeof body.text !== "string" || !isPlainText(body.text)) return rejected("bad-request")
 		try { if (!(await exactRoot(client, rootSessionId, directory))) return rejected("not-root", 409) } catch { return rejected("session-unreachable", 409) }
 		try {
-			const result = await client.sessionPromptAsync({ sessionID: rootSessionId, directory, messageID: body.messageId, parts: [{ type: "text", text: body.text }] }, request.signal)
+			const result = await client.sessionPromptAsync({ sessionID: rootSessionId, directory, messageID: body.messageId, system: WECHAT_PROMPT_SYSTEM, parts: [{ type: "text", text: body.text }] }, request.signal)
 			return explicitSuccess(result, 204) ? Response.json({ ok: true, accepted: true }) : uncertain("prompt-admission-uncertain")
 		} catch { return uncertain("prompt-admission-uncertain") }
 	}
@@ -164,25 +166,29 @@ async function handleV2Callback(pathname: string, request: Request, client: V2Co
 	return Response.json({ error: "not-found" }, { status: 404 })
 }
 
-export function createCallbackHandler(client: LegacyCallbackClient, sharedSecret: string, instanceToken: string, controlClient?: V2ControlClient): (request: Request) => Promise<Response> {
+export function createCallbackHandler(client: LegacyCallbackClient, sharedSecret: string, instanceToken: string, controlClient?: V2ControlClient, callbackDirectory?: string): (request: Request) => Promise<Response> {
+	if (controlClient && !boundedString(callbackDirectory, MAX_DIRECTORY_LENGTH)) throw new Error("Invalid callback plugin directory")
 	return async (request) => {
 		if (request.method !== "POST") return Response.json({ error: "method" }, { status: 405 })
 		if (request.headers.get("x-wechat-control-key") !== sharedSecret || request.headers.get("x-wechat-instance-token") !== instanceToken) return Response.json({ error: "unauthorized" }, { status: 401 })
 		const pathname = new URL(request.url).pathname
 		if (pathname === "/health") {
-			try { const body = object(await request.json()); if (!body) return Response.json({ error: "bad-request" }, { status: 400 }); if (body.rootSessionId) { if (!boundedString(body.rootSessionId)) return Response.json({ error: "bad-request" }, { status: 400 }); const response = object(await client.session.get({ path: { id: body.rootSessionId } })), session = sessionIdentity(response?.data); if (!session || session.id !== body.rootSessionId || session.parentID) return Response.json({ error: "not-root" }, { status: 409 }) }; return Response.json({ ok: true }) } catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
+			try { const body = object(await request.json()); if (!body) return Response.json({ error: "bad-request" }, { status: 400 }); if (body.rootSessionId) { if (!boundedString(body.rootSessionId)) return Response.json({ error: "bad-request" }, { status: 400 }); if (controlClient) { if (!(await exactRoot(controlClient, body.rootSessionId, callbackDirectory as string))) return Response.json({ error: "not-root" }, { status: 409 }) } else { const response = object(await client.session.get({ path: { id: body.rootSessionId } })), session = sessionIdentity(response?.data); if (!session || session.id !== body.rootSessionId || session.parentID) return Response.json({ error: "not-root" }, { status: 409 }) } }; return Response.json({ ok: true }) } catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
 		}
 		if (pathname === "/inject") return Response.json({ error: "legacy-inject-removed" }, { status: 410 })
-		return controlClient ? handleV2Callback(pathname, request, controlClient) : Response.json({ error: "v2-client-unavailable" }, { status: 503 })
+		return controlClient ? handleV2Callback(pathname, request, controlClient, callbackDirectory as string) : Response.json({ error: "v2-client-unavailable" }, { status: 503 })
 	}
 }
 
-export function startCallbackServer(client: LegacyCallbackClient, sharedSecret: string, instanceToken: string, controlClient?: V2ControlClient): CallbackServer {
-	const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: createCallbackHandler(client, sharedSecret, instanceToken, controlClient) })
+export function startCallbackServer(client: LegacyCallbackClient, sharedSecret: string, instanceToken: string, controlClient?: V2ControlClient, callbackDirectory?: string): CallbackServer {
+	const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: createCallbackHandler(client, sharedSecret, instanceToken, controlClient, callbackDirectory) })
 	return { endpoint: server.url.toString(), token: instanceToken, stop: () => server.stop() }
 }
 
-export function startV2CallbackServer(client: LegacyCallbackClient, serverUrl: URL | string, directory: string, sharedSecret: string, instanceToken: string): CallbackServer { return startCallbackServer(client, sharedSecret, instanceToken, createV2ControlClient(serverUrl, directory)) }
+export function startV2CallbackServer(client: LegacyCallbackClient, directory: string, sharedSecret: string, instanceToken: string): CallbackServer {
+	// Guard and adapt the supplied authenticated transport before opening a port.
+	return startCallbackServer(client, sharedSecret, instanceToken, createV2ControlClient(client), directory)
+}
 
 export async function rpc(endpoint: string, secret: string, body: object, timeoutMs = 10_000): Promise<any> {
 	const response = await makeRpcRequest(endpoint, secret, body, timeoutMs)

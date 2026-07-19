@@ -44,7 +44,9 @@ export const pluginLifecycleTestHooks = {
 	},
 }
 
-export function startPluginCallbackServer(client: Parameters<typeof startV2CallbackServer>[0], serverUrl: URL, directory: string, sharedSecret: string, instanceToken: string): CallbackServer { return startV2CallbackServer(client, serverUrl, directory, sharedSecret, instanceToken) }
+export function startPluginCallbackServer(client: Parameters<typeof startV2CallbackServer>[0], _serverUrl: URL, directory: string, sharedSecret: string, instanceToken: string): CallbackServer {
+	return startV2CallbackServer(client, directory, sharedSecret, instanceToken)
+}
 
 export function registerControlCommands(config: any): void {
 	config.command ??= {}

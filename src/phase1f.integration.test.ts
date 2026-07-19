@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { createOpencodeClient } from "@opencode-ai/sdk/client"
 import { MockWeChatAdapter } from "./adapter"
 import { BrokerService } from "./broker"
 import { startCallbackServer } from "./client"
@@ -17,7 +18,7 @@ test("plugin callback and broker integrate prompt admission, native resolution, 
 		permissionList: async () => ({ data: [...pendingPermissions].map((id) => ({ id, sessionID: "root" })), error: undefined, status: 200 }),
 		permissionReply: async ({ requestID, reply }) => { pendingPermissions.delete(requestID); permissionReplies.push(reply); return { data: true, error: undefined, status: 200 } },
 	}
-	const callback = startCallbackServer({ session: { get: async () => ({ data: { id: "root" } }), prompt: async () => ({}) } }, "secret", "token", controlClient)
+	const callback = startCallbackServer({ session: { get: async () => ({ data: { id: "root" } }), prompt: async () => ({}) } }, "secret", "token", controlClient, "directory")
 	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(); store.register("owner", "token", callback.endpoint); store.bind({ rootSessionId: "root", directory: "directory", ownerInstance: "owner" }); store.refreshRoute("controller", "context")
 	const broker = new BrokerService(store, adapter, "secret", "worker"), auth = (method: string, extra: object) => new Request("http://broker", { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret" }, body: JSON.stringify({ method, instanceId: "owner", instanceToken: "token", rootSessionId: "root", ...extra }) }), inbound = (id: string, text: string) => broker.handleInbound({ id, fromUserId: "controller", contextToken: "context", text: `#1\n${text}`, cursorHint: id })
 	try {
@@ -43,7 +44,8 @@ test("actual SDK v2 HTTP contract admits concurrently and closes native requests
 		if (request.method === "POST" && url.pathname === "/permission/sdk-permission/reply") { permissionBodies.push(await request.json()); return Response.json(true) }
 		return Response.json({ error: "not-found" }, { status: 404 })
 	} })
-	const callback = startPluginCallbackServer({ session: { get: async () => ({ data: { id: "root" } }), prompt: async () => ({}) } }, new URL(upstream.url), "directory", "secret", "token"), headers = { "content-type": "application/json", "x-wechat-control-key": "secret", "x-wechat-instance-token": "token" }
+	const supplied = createOpencodeClient({ baseUrl: upstream.url.toString(), directory: "directory" })
+	const callback = startPluginCallbackServer(supplied, new URL("http://unreachable-server-url.invalid:1"), "directory", "secret", "token"), headers = { "content-type": "application/json", "x-wechat-control-key": "secret", "x-wechat-instance-token": "token" }
 	const post = (pathname: string, body: object) => fetch(new URL(pathname, callback.endpoint), { method: "POST", headers, body: JSON.stringify({ rootSessionId: "root", directory: "directory", ...body }) })
 	try {
 		const first = post("/submit-prompt", { inboundId: "one", messageId: "message-one", text: "first" }); await firstStarted

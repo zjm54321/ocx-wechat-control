@@ -1,6 +1,6 @@
 {
   "name": "@mingzzz/ocx-wechat-control",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Restricted WeChat takeover plugin for OpenCode",
   "type": "module",
   "main": "./dist/index.js",
@@ -31,15 +31,15 @@
     "prepack": "bun run build"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "1.14.19",
+    "@opencode-ai/sdk": "1.18.3",
     "effect": "4.0.0-beta.83",
     "weixin-mcp": "1.7.7"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.14.19"
+    "@opencode-ai/plugin": ">=1.18.3"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.14.19",
+    "@opencode-ai/plugin": "1.18.3",
     "@types/bun": "1.2.22",
     "typescript": "5.8.2"
   },

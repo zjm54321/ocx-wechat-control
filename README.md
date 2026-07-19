@@ -1,18 +1,18 @@
-# WeChat Control 0.2.2：受限微信接管
+# WeChat Control 0.2.3：受限微信接管
 
-这是 OpenCode 用户级插件和持久 broker worker，面向**一个微信账号、一个固定聊天窗口**。首次由微信纯文本 `id` 认定固定 controller；之后只有同一 sender 可以使用或刷新 route。0.2 系列采用原生异步 admission、原生 Question/Permission 转发和显式回复，不再自动镜像 assistant 文本；0.2.2 修复已送达的 `weixin_send` 响应被误判为 UNKNOWN。
+这是 OpenCode 用户级插件和持久 broker worker，面向**一个微信账号、一个固定聊天窗口**。首次由微信纯文本 `id` 认定固定 controller；之后只有同一 sender 可以使用或刷新 route。0.2 系列采用原生异步 admission、原生 Question/Permission 转发和显式回复，不自动镜像 assistant 文本。0.2.3 为每个微信入站回合附加要求调用 `wechat_reply` 的 system directive，并保留已送达 `weixin_send` 响应不被误判为 UNKNOWN 的修复。
 
 ## 安装
 
 要求 Bun 1.3.14 或更高版本：
 
 ```sh
-npm install @mingzzz/ocx-wechat-control@0.2.2
+npm install @mingzzz/ocx-wechat-control@0.2.3
 ```
 
 ```json
 {
-  "plugin": [["@mingzzz/ocx-wechat-control@0.2.2", { "enabled": true }]],
+  "plugin": [["@mingzzz/ocx-wechat-control@0.2.3", { "enabled": true }]],
   "mcp": { "weixin": { "enabled": false } }
 }
 ```
@@ -41,7 +41,7 @@ npm install @mingzzz/ocx-wechat-control@0.2.2
 
 ## 回复与 typing
 
-assistant 内容**不会自动发送到微信**，completion 事件也不会镜像正文。模型只有在确实需要时才显式调用 `wechat_reply({text})`。该调用按 tool call ID 持久去重：相同 ID 和相同文本返回既有 SENT/UNKNOWN；相同 ID 配不同文本会冲突；UNKNOWN 不重试发送。
+普通本地 TUI 回合仍只在模型显式调用 `wechat_reply` 时发送回复。每个微信入站回合都会收到 per-turn system directive，要求模型作答后调用 `wechat_reply({text})`；assistant 文本仍不会由 broker 事件自动镜像到微信。该调用按 tool call ID 持久去重：相同 ID 和相同文本返回既有 SENT/UNKNOWN；相同 ID 配不同文本会冲突；UNKNOWN 不重试发送。
 
 当已登记 root 存在 queued/busy/retry 工作时，固定聊天显示“正在输入”；全局无工作、关闭接管、启动恢复或 worker 退出时发送 OFF。typing 使用当前 recipient/context，并对 route 变化、失败重试和 shutdown 做竞态保护。
 
@@ -62,4 +62,4 @@ git diff --check
 
 测试使用临时 SQLite、真实本地 callback HTTP 边界、fake SDK client/MCP 和 mock adapter，不登录、poll 或发送真实微信。npm 包只包含 `dist/index.js`、`dist/worker.js`、README、LICENSE 和 package metadata；不包含源码测试、状态库、日志、账号、QR/cache 或项目编排文件。
 
-维护者发布 `v0.2.2` 时应先完成全部检查并确认 tag 与 package version 一致，再由仓库 Trusted Publisher/OIDC workflow 发布。本项目不会从开发命令自动发布。
+维护者发布 `v0.2.3` 时应先完成全部检查并确认 tag 与 package version 一致，再由仓库 Trusted Publisher/OIDC workflow 发布。本项目不会从开发命令自动发布。

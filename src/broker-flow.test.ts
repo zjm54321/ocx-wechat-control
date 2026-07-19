@@ -122,6 +122,13 @@ test("id and newly generated prompts use the current compact alias", async () =>
 	store.close()
 })
 
+test("id excludes swept orphan bindings and compacts remaining aliases", async () => {
+	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(), broker = new BrokerService(store, adapter, "secret", "worker", async () => Response.json({ ok: true }))
+	store.register("orphan", "orphan-token", "http://127.0.0.1:1"); store.register("live", "live-token", "http://127.0.0.1:2"); store.bind({ rootSessionId: "orphan-root", directory: "orphan", ownerInstance: "orphan", title: "Closed" }); store.bind({ rootSessionId: "live-root", directory: "live", ownerInstance: "live", title: "Live" }); store.refreshRoute("controller", "ctx")
+	store.db.query("DELETE FROM instances WHERE instance_id='orphan'").run(); expect(store.sweepOrphanBindings()).toBe(1)
+	await broker.handleInbound({ id: "orphan-list", fromUserId: "controller", contextToken: "ctx", text: "id", cursorHint: "orphan-list" }); expect(adapter.sent.at(-1)?.text).toBe("#1  Live"); store.close()
+})
+
 test("explicit native request remains answerable after its displayed alias moves", async () => {
 	const callbacks: string[] = [], { store, adapter, broker } = flow(async (url) => { callbacks.push(new URL(String(url)).pathname); return Response.json({ ok: true, resolved: true }) }, ["a", "b"])
 	await openNative(broker, { requestId: "moving-q", rootSessionId: "b", kind: "QUESTION", payload: questionPayload("b") })

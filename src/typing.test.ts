@@ -99,6 +99,19 @@ describe("typing coordinator", () => {
 		await broker.handleRequest(request("back-global")); await Bun.sleep(5); expect(store.desiredTyping()).toBe(false); expect(calls.at(-1)).toBe(2)
 		await typing.shutdown(); store.close()
 	})
+	test("broker unregister accepts an exact stale token, cleans multiple roots, and immediately turns typing off", async () => {
+		const store = setup(), calls: number[] = [], typing = new TypingCoordinator(store, { loadAccount: async () => ({ token: "t", baseUrl: "https://example.test", accountId: "a" }), api: { getConfig: async () => ({ typing_ticket: "ticket" }), sendTyping: async (_u, _t, status) => { calls.push(status) } }, debounceMs: 0 })
+		store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "a", directory: "a", ownerInstance: "owner" }); store.bind({ rootSessionId: "b", directory: "b", ownerInstance: "owner" })
+		for (const [root, alias] of [["a", 1], ["b", 2]] as const) { const id = `${root}-prompt`; store.claimPromptSubmission({ submissionId: id, inboundId: `${id}-in`, root, owner: "owner", alias, body: root }); store.beginRuntimeAdmission(id, root, "owner") }
+		await typing.startup(); await typing.flush(); expect(calls.at(-1)).toBe(1); store.db.query("UPDATE instances SET heartbeat_ms=0 WHERE instance_id='owner'").run()
+		const refresh = typing.refresh.bind(typing); let refreshes = 0
+		const brokerTyping = { refresh: () => { refreshes++; refresh() } } as TypingCoordinator
+		const broker = new BrokerService(store, new MockWeChatAdapter(), "secret", "worker", async () => Response.json({ ok: true }), { typing: brokerTyping }), request = (token?: string, method = "unregister") => new Request("http://127.0.0.1", { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret" }, body: JSON.stringify({ method, instanceId: "owner", ...(token === undefined ? {} : { instanceToken: token }) }) })
+		expect((await broker.handleRequest(request("token", "status"))).status).toBe(403)
+		expect((await broker.handleRequest(request())).status).toBe(403); expect((await broker.handleRequest(request(""))).status).toBe(403)
+		const failed = await broker.handleRequest(request("wrong")); expect(await failed.json()).toEqual({ ok: false }); expect(refreshes).toBe(0); expect(store.bindings()).toHaveLength(2); const before = calls.length
+		const response = await broker.handleRequest(request("token")); expect(await response.json()).toEqual({ ok: true }); expect(refreshes).toBe(1); await Bun.sleep(5); expect(store.bindings()).toEqual([]); expect(store.instance("owner")).toBeUndefined(); expect(store.desiredTyping()).toBe(false); expect(calls.slice(before)).toEqual([2]); await typing.shutdown(); store.close()
+	})
 	test("production worker constructs, starts, refreshes, and shuts down coordinator", async () => {
 		const store = new Store(":memory:"), events: string[] = [], typing = { startup: async () => { events.push("startup") }, refresh: () => { events.push("refresh") }, shutdown: async () => { events.push("shutdown") } } as unknown as TypingCoordinator
 		await runWorker({ enabled: true, weixinCommand: ["node", "fixed.js"] }, {

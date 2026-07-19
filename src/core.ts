@@ -410,10 +410,20 @@ CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guar
 		return true
 	}
 	unregister(instanceId: string, instanceToken: string): boolean {
-		if (!this.authenticate(instanceId, instanceToken)) return false
 		return this.db.transaction(() => {
-			this.db.query("DELETE FROM native_answer_guards WHERE request_id IN (SELECT request_id FROM native_requests WHERE owner_instance=?)").run(instanceId)
+			const instance = this.db.query("SELECT instance_token AS token FROM instances WHERE instance_id=?").get(instanceId) as { token: string } | null
+			if (!instance || instance.token !== instanceToken) return false
+			const roots = this.db.query("SELECT root_session_id AS root FROM bindings WHERE owner_instance=? AND active=1 ORDER BY alias").all(instanceId) as Array<{ root: string }>
+			for (const { root } of roots) this.deactivateBindingInternal(root, instanceId)
 			return this.db.query("DELETE FROM instances WHERE instance_id=?").run(instanceId).changes === 1
+		})()
+	}
+	sweepOrphanBindings(): number {
+		return this.db.transaction(() => {
+			const bindings = this.db.query("SELECT root_session_id AS root,owner_instance AS owner FROM bindings WHERE active=1 AND NOT EXISTS(SELECT 1 FROM instances WHERE instance_id=bindings.owner_instance) ORDER BY alias").all() as Array<{ root: string; owner: string }>
+			let deactivated = 0
+			for (const binding of bindings) if (this.deactivateBindingInternal(binding.root, binding.owner)) deactivated++
+			return deactivated
 		})()
 	}
 	instance(instanceId: string): { endpoint: string; instanceToken: string; online: boolean } | undefined {
@@ -448,18 +458,19 @@ CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guar
 	}
 	bindings(): Binding[] { return (this.db.query("SELECT alias AS registrationAlias,root_session_id AS rootSessionId,directory,owner_instance AS ownerInstance,title,active FROM bindings WHERE active=1 ORDER BY alias").all() as any[]).map((row, index) => this.bindingRow(row, index + 1)!) }
 	deactivateBinding(root: string, owner: string): boolean {
-		return this.db.transaction(() => {
-			const binding = this.storedBindingForRoot(root)
-			if (!binding?.active || binding.ownerInstance !== owner) return false
-			const now = new Date().toISOString()
-			if (this.db.query("UPDATE bindings SET active=0,updated_at=? WHERE root_session_id=? AND owner_instance=? AND active=1").run(now, root, owner).changes !== 1) return false
-			this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND owner_instance=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, root, owner)
-			this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=? WHERE root_session_id=? AND owner_instance=?").run(now, root, owner)
-			this.db.query("UPDATE inbound SET state='UNKNOWN',reason='binding-deactivated',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, root)
-			this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, root)
-			this.cancelV6Root(root, owner, now)
-			return true
-		})()
+		return this.db.transaction(() => this.deactivateBindingInternal(root, owner))()
+	}
+	private deactivateBindingInternal(root: string, owner: string): boolean {
+		const binding = this.storedBindingForRoot(root)
+		if (!binding?.active || binding.ownerInstance !== owner) return false
+		const now = new Date().toISOString()
+		if (this.db.query("UPDATE bindings SET active=0,updated_at=? WHERE root_session_id=? AND owner_instance=? AND active=1").run(now, root, owner).changes !== 1) return false
+		this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND owner_instance=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, root, owner)
+		this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=? WHERE root_session_id=? AND owner_instance=?").run(now, root, owner)
+		this.db.query("UPDATE inbound SET state='UNKNOWN',reason='binding-deactivated',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, root)
+		this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, root)
+		this.cancelV6Root(root, owner, now)
+		return true
 	}
 	refreshRoute(conversationId: string, contextToken: string): void { this.db.query("UPDATE global_route SET conversation_id=?,context_token=?,updated_at=? WHERE singleton=1").run(conversationId, contextToken, new Date().toISOString()) }
 	route(): GlobalRoute { return this.db.query("SELECT conversation_id AS conversationId,context_token AS contextToken,updated_at AS updatedAt FROM global_route WHERE singleton=1").get() as GlobalRoute }

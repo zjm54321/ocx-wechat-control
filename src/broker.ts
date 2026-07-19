@@ -179,9 +179,10 @@ export class BrokerService {
 			if (!(await this.callbackHealth(body.endpoint, body.instanceToken))) return Response.json({ error: "callback-unreachable" }, { status: 409 })
 			this.store.register(body.instanceId, body.instanceToken, body.endpoint); return Response.json({ ok: true })
 		}
-		if (!validId(body.instanceId) || !validId(body.instanceToken) || !this.store.authenticate(body.instanceId, body.instanceToken)) return Response.json({ error: "instance-unauthorized" }, { status: 403 })
+		if (!validId(body.instanceId) || !validId(body.instanceToken)) return Response.json({ error: "instance-unauthorized" }, { status: 403 })
+		if (body.method === "unregister") { const ok = this.store.unregister(body.instanceId, body.instanceToken); if (ok) this.refreshTyping(); return Response.json({ ok }) }
+		if (!this.store.authenticate(body.instanceId, body.instanceToken)) return Response.json({ error: "instance-unauthorized" }, { status: 403 })
 		if (body.method === "heartbeat") return Response.json({ ok: this.store.touch(body.instanceId, body.instanceToken) })
-		if (body.method === "unregister") return Response.json({ ok: this.store.unregister(body.instanceId, body.instanceToken) })
 		if (body.method === "bind-current") return Response.json({ error: "deprecated-manual-binding" }, { status: 410 })
 		if (body.method === "leave-root") {
 			if (!validId(body.rootSessionId) || typeof body.directory !== "string" || !body.directory || body.directory.length > 32_767 || (body.title !== null && body.title !== undefined && (typeof body.title !== "string" || body.title.length > 1000))) return Response.json({ error: "invalid-registration" }, { status: 400 })

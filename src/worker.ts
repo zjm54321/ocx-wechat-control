@@ -50,6 +50,7 @@ export async function runWorker(config: WorkerConfig, overrides: Partial<WorkerD
 	try {
 		lock = await deps.acquireLock(state.directory, state.secret, initial)
 		store = deps.createStore(path.join(state.directory, "state.sqlite"))
+		store.sweepOrphanBindings()
 		adapter = deps.createAdapter(config)
 		typing = deps.createTyping?.(store)
 		broker = deps.createBroker(store, adapter, state.secret, workerToken, typing, workerMetadata)
@@ -62,6 +63,7 @@ export async function runWorker(config: WorkerConfig, overrides: Partial<WorkerD
 			if (maintenance) return maintenance
 			const current = (async () => {
 				try {
+					store?.sweepOrphanBindings()
 					store?.sweepOrphanWaiting()
 					store?.sweepOutboundEchoes()
 					if (typeof broker?.reconcileActiveRuntimes === "function") await broker.reconcileActiveRuntimes()

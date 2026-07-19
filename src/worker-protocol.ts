@@ -1,4 +1,4 @@
-export const WORKER_PACKAGE_VERSION = "0.2.4"
+export const WORKER_PACKAGE_VERSION = "0.2.5"
 export const WORKER_PROTOCOL_VERSION = 1
 export const WORKER_SCHEMA_VERSION = 7
 export const WORKER_CAPABILITIES = ["v2-callbacks", "async-prompt-admission", "native-question-permission", "legacy-inject-disabled", "dynamic-active-aliases", "logical-wechat-reply-identity"] as const

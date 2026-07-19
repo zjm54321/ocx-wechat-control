@@ -16,7 +16,9 @@ await Promise.all([mkdir(path.join(state, "broker.lock"), { recursive: true }), 
 async function bootstrapPlugin(): Promise<void> {
 	await writeFile(path.join(opencodeConfigDir, "package.json"), JSON.stringify({ private: true, dependencies: { "@opencode-ai/plugin": "1.18.3" } }, null, 2))
 	const child = Bun.spawn([process.execPath, "install", "--ignore-scripts", "--no-progress"], { cwd: opencodeConfigDir, env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("OPENCODE_"))), stdout: "pipe", stderr: "pipe" })
-	const output = await Promise.race([Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]).then(async ([stdout, stderr]) => { await child.exited; return { stdout, stderr, timedOut: false } }), Bun.sleep(120_000).then(() => ({ stdout: "", stderr: "", timedOut: true }))])
+	let timeout: ReturnType<typeof setTimeout> | undefined
+	const deadline = new Promise<{ stdout: string; stderr: string; timedOut: true }>((resolve) => { timeout = setTimeout(() => resolve({ stdout: "", stderr: "", timedOut: true }), 120_000); timeout.unref() })
+	const output = await Promise.race([Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]).then(async ([stdout, stderr]) => { await child.exited; return { stdout, stderr, timedOut: false as const } }), deadline]).finally(() => { if (timeout) clearTimeout(timeout) })
 	if (output.timedOut) { child.kill(9); await child.exited; throw new Error(`plugin bootstrap timed out after 120s in ${opencodeConfigDir}; command=${process.execPath} install --ignore-scripts --no-progress`) }
 	if (child.exitCode !== 0) throw new Error(`plugin bootstrap failed (exit ${child.exitCode}) in ${opencodeConfigDir}\nstdout:\n${output.stdout}\nstderr:\n${output.stderr}`)
 }
@@ -24,7 +26,7 @@ try { await bootstrapPlugin() } catch (error) { await rm(root, { recursive: true
 let enabled = false, registrations = 0
 const brokerMethods: string[] = []
 const adapter = ["node", path.join(repo, "node_modules", "weixin-mcp", "dist", "cli.js")], workerEntrypoint = path.join(repo, "dist", "worker.js")
-const metadata = { packageVersion: "0.2.4", protocolVersion: 1, capabilities: ["v2-callbacks", "async-prompt-admission", "native-question-permission", "legacy-inject-disabled", "dynamic-active-aliases", "logical-wechat-reply-identity"], workerPid: process.pid, workerEntrypoint, adapterCommand: adapter, adapterProvenance: { kind: "fixed-local-dependency", package: "weixin-mcp", version: "1.7.7", entrypoint: adapter[1] }, schemaVersion: 7 }
+const metadata = { packageVersion: "0.2.5", protocolVersion: 1, capabilities: ["v2-callbacks", "async-prompt-admission", "native-question-permission", "legacy-inject-disabled", "dynamic-active-aliases", "logical-wechat-reply-identity"], workerPid: process.pid, workerEntrypoint, adapterCommand: adapter, adapterProvenance: { kind: "fixed-local-dependency", package: "weixin-mcp", version: "1.7.7", entrypoint: adapter[1] }, schemaVersion: 7 }
 const broker = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
 	const body = await request.json() as any
 	brokerMethods.push(String(body.method))

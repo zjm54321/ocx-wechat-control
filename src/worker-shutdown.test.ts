@@ -12,6 +12,7 @@ test("shutdown waits for active maintenance before closing store and releasing l
 	const blocked = new Promise<void>((resolve) => { releaseReconcile = resolve })
 	const started = new Promise<void>((resolve) => { maintenanceStarted = resolve })
 	const store = {
+		sweepOrphanBindings: () => { events.push("binding.sweep") },
 		sweepOrphanWaiting: () => { events.push("sweep") },
 		sweepOutboundEchoes: () => {},
 		expireRuntimeLeases: () => { events.push("expire") },
@@ -50,6 +51,7 @@ test("shutdown waits for active maintenance before closing store and releasing l
 		expect(events.indexOf("store.close")).toBeLessThan(events.indexOf("lock.release"))
 		expect(events.filter((event) => event === "lock.update")).toHaveLength(2)
 		expect(events.filter((event) => event === "expire")).toHaveLength(1)
+		expect(events.filter((event) => event === "binding.sweep")).toHaveLength(3)
 	} finally {
 		globalThis.setInterval = originalSetInterval
 		globalThis.clearInterval = originalClearInterval

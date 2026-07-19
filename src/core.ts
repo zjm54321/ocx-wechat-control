@@ -16,6 +16,9 @@ export const PERMISSION_DENIED_TEXT = "OpenCode 需要本地权限确认；受�
 export const COMPLETION_TEXT = "任务已完成。"
 export const COMPLETION_ERROR_TEXT = "任务执行失败。"
 export const INSTANCE_TTL_MS = 45_000
+export const BINDING_REAP_PROBE_SPACING_MS = 30_000
+export const BINDING_REAP_FAILURE_THRESHOLD = 5
+export const BINDING_REAP_FAILURE_SPAN_MS = 120_000
 export const ORPHAN_PENDING_TTL_MS = 12 * 60_000
 export const OUTBOUND_ECHO_TTL_MS = 10 * 60_000
 export const REQUEST_CODE_PATTERN = /^[QP][A-Z2-7]{6}$/
@@ -162,6 +165,25 @@ export interface Binding {
 	active: boolean
 }
 
+export interface BindingReapCandidate {
+	rootSessionId: string
+	ownerInstance: string
+	bindingRevision: number
+	bindingUpdatedAt: string
+	endpoint: string
+	tokenFingerprint: string
+	instanceRevision: number
+	observedHeartbeatMs: number
+}
+
+export interface BindingReapState extends BindingReapCandidate {
+	consecutiveFailures: number
+	firstFailureMs: number
+	lastFailureMs: number
+	lastResult: string
+	updatedAt: string
+}
+
 export interface GlobalRoute { conversationId: string | null; contextToken: string | null; updatedAt: string | null }
 export type RoutedBinding = Binding & { conversationId: string; contextToken: string }
 export type RouteAcceptance = "CLAIMED" | "REFRESHED" | "REJECTED"
@@ -222,11 +244,11 @@ export class Store {
 	}
 	private migrate(databasePath: string): string | undefined {
 		const userVersion = (this.db.query("PRAGMA user_version").get() as any)?.user_version ?? 0
-		if (userVersion > 7) throw new Error("unsupported database schema")
+		if (userVersion > 8) throw new Error("unsupported database schema")
 		const has = (table: string) => Boolean(this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table))
 		const hasLegacyData = has("bindings") || has("inbound") || has("outbound")
 		let snapshot: string | undefined
-		if (databasePath !== ":memory:" && userVersion < 7 && (userVersion > 0 || hasLegacyData)) {
+		if (databasePath !== ":memory:" && userVersion < 8 && (userVersion > 0 || hasLegacyData)) {
 			snapshot = this.createConsistentSnapshot(databasePath)
 			this.migrationSnapshotInProgress = snapshot
 			this.options.onSnapshot?.(snapshot)
@@ -272,6 +294,11 @@ CREATE TABLE IF NOT EXISTS session_activity(root_session_id TEXT PRIMARY KEY,own
 CREATE TABLE IF NOT EXISTS control_outbound(outbound_id TEXT PRIMARY KEY,dedupe_key TEXT NOT NULL UNIQUE,root_session_id TEXT NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbound_echoes(echo_hash TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL DEFAULT '',payload TEXT NOT NULL,expires_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS binding_reap_state(
+ root_session_id TEXT PRIMARY KEY,owner_instance TEXT NOT NULL,binding_updated_at TEXT NOT NULL,endpoint TEXT NOT NULL,
+ token_fingerprint TEXT NOT NULL CHECK(length(token_fingerprint)=64),observed_heartbeat_ms INTEGER NOT NULL CHECK(observed_heartbeat_ms>=0),
+ consecutive_failures INTEGER NOT NULL CHECK(consecutive_failures>=1),first_failure_ms INTEGER NOT NULL CHECK(first_failure_ms>=0),
+ last_failure_ms INTEGER NOT NULL CHECK(last_failure_ms>=first_failure_ms),last_result TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS prompt_submissions(
  submission_id TEXT PRIMARY KEY CHECK(length(submission_id) BETWEEN 1 AND 500),inbound_id TEXT NOT NULL UNIQUE CHECK(length(inbound_id) BETWEEN 1 AND 500),
  root_session_id TEXT NOT NULL CHECK(length(root_session_id) BETWEEN 1 AND 500),owner_instance TEXT NOT NULL CHECK(length(owner_instance) BETWEEN 1 AND 500),alias INTEGER NOT NULL CHECK(alias>0),
@@ -304,6 +331,10 @@ CREATE INDEX IF NOT EXISTS idx_native_alias_state ON native_requests(alias,state
 CREATE INDEX IF NOT EXISTS idx_native_root_state ON native_requests(root_session_id,state);
 CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guards(request_id);
 `)
+			add("instances", "instance_revision", "INTEGER NOT NULL DEFAULT 1 CHECK(instance_revision>=1)")
+			add("bindings", "binding_revision", "INTEGER NOT NULL DEFAULT 1 CHECK(binding_revision>=1)")
+			add("binding_reap_state", "binding_revision", "INTEGER NOT NULL DEFAULT 1 CHECK(binding_revision>=1)")
+			add("binding_reap_state", "instance_revision", "INTEGER NOT NULL DEFAULT 1 CHECK(instance_revision>=1)")
 			add("pending_replies", "control_revision", "INTEGER NOT NULL DEFAULT 0")
 			add("checkpoints", "request_key", "TEXT"); add("checkpoints", "control_revision", "INTEGER NOT NULL DEFAULT 0")
 			this.db.exec("UPDATE checkpoints SET request_key=checkpoint_id WHERE request_key IS NULL")
@@ -354,6 +385,7 @@ CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guar
 				this.db.query("INSERT OR IGNORE INTO global_route(singleton,conversation_id,context_token,updated_at) VALUES(1,NULL,NULL,NULL)").run()
 			}
 			add("bindings", "active", "INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))")
+			add("bindings", "binding_revision", "INTEGER NOT NULL DEFAULT 1 CHECK(binding_revision>=1)")
 			if (userVersion > 0 && userVersion < 6) {
 				const now = new Date().toISOString()
 				this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now)
@@ -361,14 +393,14 @@ CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guar
 				this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE state IN ('WAITING','SENDING')").run(now)
 				this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=?").run(now)
 			}
-			this.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','7')").run()
-			this.db.exec("PRAGMA user_version=7")
+			this.db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','8')").run()
+			this.db.exec("PRAGMA user_version=8")
 		})()
 		return snapshot
 	}
 	private createConsistentSnapshot(databasePath: string): string {
 		const version = ((this.db.query("PRAGMA user_version").get() as any)?.user_version ?? 0)
-		const label = version < 5 ? "pre-v5-v7" : version < 6 ? "pre-v6-v7" : "pre-v7"
+		const label = version < 5 ? "pre-v5-v8" : version < 6 ? "pre-v6-v8" : version < 7 ? "pre-v7-v8" : "pre-v8"
 		const backup = `${databasePath}.${label}-${Date.now()}-${crypto.randomUUID()}.bak`, temp = `${backup}.tmp`
 		const escaped = temp.replaceAll("'", "''")
 		try { this.db.exec(`VACUUM INTO '${escaped}'`); renameSync(temp, backup); return backup }
@@ -398,16 +430,26 @@ CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guar
 		})()
 	}
 	register(instanceId: string, instanceToken: string, endpoint: string): void {
-		this.db.query("INSERT OR REPLACE INTO instances VALUES(?,?,?,?,?)").run(instanceId, endpoint, instanceToken, Date.now(), new Date().toISOString())
+		this.db.transaction(() => {
+			const previous = this.db.query("SELECT instance_revision AS revision FROM instances WHERE instance_id=?").get(instanceId) as { revision: number } | null
+			this.db.query("DELETE FROM binding_reap_state WHERE owner_instance=?").run(instanceId)
+			const heartbeat = Date.now(), revision = (previous?.revision ?? 0) + 1, createdAt = new Date().toISOString()
+			if (previous) this.db.query("UPDATE instances SET endpoint=?,instance_token=?,heartbeat_ms=?,created_at=?,instance_revision=? WHERE instance_id=?").run(endpoint, instanceToken, heartbeat, createdAt, revision, instanceId)
+			else this.db.query("INSERT INTO instances(instance_id,endpoint,instance_token,heartbeat_ms,created_at,instance_revision) VALUES(?,?,?,?,?,?)").run(instanceId, endpoint, instanceToken, heartbeat, createdAt, revision)
+		})()
 	}
 	authenticate(instanceId: string, instanceToken: string): boolean {
 		const row = this.db.query("SELECT instance_token AS token,heartbeat_ms AS heartbeat FROM instances WHERE instance_id=?").get(instanceId) as { token: string; heartbeat: number } | null
 		return Boolean(row && row.token === instanceToken && Date.now() - row.heartbeat <= INSTANCE_TTL_MS)
 	}
 	touch(instanceId: string, instanceToken: string): boolean {
-		if (!this.authenticate(instanceId, instanceToken)) return false
-		this.db.query("UPDATE instances SET heartbeat_ms=? WHERE instance_id=?").run(Date.now(), instanceId)
-		return true
+		return this.db.transaction(() => {
+			const instance = this.db.query("SELECT instance_token AS token FROM instances WHERE instance_id=?").get(instanceId) as { token: string } | null
+			if (!instance || instance.token !== instanceToken) return false
+			this.db.query("UPDATE instances SET heartbeat_ms=?,instance_revision=instance_revision+1 WHERE instance_id=?").run(Date.now(), instanceId)
+			this.db.query("DELETE FROM binding_reap_state WHERE owner_instance=?").run(instanceId)
+			return true
+		})()
 	}
 	unregister(instanceId: string, instanceToken: string): boolean {
 		return this.db.transaction(() => {
@@ -432,15 +474,17 @@ CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guar
 	}
 	bind(input: { rootSessionId: string; directory: string; ownerInstance: string; title?: string | null; alias?: number }): Binding {
 		if (input.alias !== undefined) throw new Error("manual alias is deprecated")
-		const now = new Date().toISOString(), title = sanitizeTitle(input.title)
+		let now = new Date().toISOString(); const title = sanitizeTitle(input.title)
 		let binding: Binding | undefined
 		this.db.transaction(() => {
+			this.db.query("DELETE FROM binding_reap_state WHERE root_session_id=?").run(input.rootSessionId)
 			const existing = this.storedBindingForRoot(input.rootSessionId)
 			if (existing) {
 				if (existing.active && existing.ownerInstance !== input.ownerInstance && this.instance(existing.ownerInstance)?.online) throw new Error("owner-live")
-				this.db.query("UPDATE bindings SET directory=?,owner_instance=?,title=?,active=1,updated_at=? WHERE root_session_id=?").run(input.directory, input.ownerInstance, title, now, input.rootSessionId)
+				const changed = existing.directory !== input.directory || existing.ownerInstance !== input.ownerInstance || existing.title !== title || !existing.active
+				this.db.query("UPDATE bindings SET directory=?,owner_instance=?,title=?,active=1,updated_at=?,binding_revision=binding_revision+? WHERE root_session_id=?").run(input.directory, input.ownerInstance, title, now, changed ? 1 : 0, input.rootSessionId)
 				if (existing.ownerInstance !== input.ownerInstance) { this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, input.rootSessionId); this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,owner_instance=?,updated_at=? WHERE root_session_id=?").run(input.ownerInstance, now, input.rootSessionId); this.db.query("UPDATE inbound SET state='UNKNOWN',reason='owner-rebound',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, input.rootSessionId); this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, input.rootSessionId); this.cancelV6Root(input.rootSessionId, input.ownerInstance, now) }
-			} else this.db.query("INSERT INTO bindings(root_session_id,directory,owner_instance,title,active,created_at,updated_at) VALUES(?,?,?,?,1,?,?)").run(input.rootSessionId, input.directory, input.ownerInstance, title, now, now)
+			} else this.db.query("INSERT INTO bindings(root_session_id,directory,owner_instance,title,active,created_at,updated_at,binding_revision) VALUES(?,?,?,?,1,?,?,1)").run(input.rootSessionId, input.directory, input.ownerInstance, title, now, now)
 			this.db.query("UPDATE control_state SET enabled=1,revision=revision+1 WHERE singleton=1 AND enabled=0").run()
 			binding = this.bindingForRoot(input.rootSessionId)
 		})()
@@ -464,13 +508,88 @@ CREATE INDEX IF NOT EXISTS idx_native_answer_guard_request ON native_answer_guar
 		const binding = this.storedBindingForRoot(root)
 		if (!binding?.active || binding.ownerInstance !== owner) return false
 		const now = new Date().toISOString()
-		if (this.db.query("UPDATE bindings SET active=0,updated_at=? WHERE root_session_id=? AND owner_instance=? AND active=1").run(now, root, owner).changes !== 1) return false
+		if (this.db.query("UPDATE bindings SET active=0,binding_revision=binding_revision+1,updated_at=? WHERE root_session_id=? AND owner_instance=? AND active=1").run(now, root, owner).changes !== 1) return false
+		this.db.query("DELETE FROM binding_reap_state WHERE root_session_id=?").run(root)
 		this.db.query("UPDATE checkpoints SET state='CANCELLED',updated_at=? WHERE root_session_id=? AND owner_instance=? AND state IN ('SENDING','OPEN','ANSWERING','UNKNOWN')").run(now, root, owner)
 		this.db.query("UPDATE session_activity SET running=0,idle=1,origin='NONE',candidate_run=NULL,updated_at=? WHERE root_session_id=? AND owner_instance=?").run(now, root, owner)
 		this.db.query("UPDATE inbound SET state='UNKNOWN',reason='binding-deactivated',updated_at=? WHERE state='INJECTING' AND message_id IN (SELECT inbound_id FROM pending_replies WHERE root_session_id=? AND state='WAITING')").run(now, root)
 		this.db.query("UPDATE pending_replies SET state='UNKNOWN',updated_at=? WHERE root_session_id=? AND state='WAITING'").run(now, root)
 		this.cancelV6Root(root, owner, now)
 		return true
+	}
+	staleBindingCandidates(nowMs = Date.now(), staleAfterMs = INSTANCE_TTL_MS): BindingReapCandidate[] {
+		if (!Number.isSafeInteger(nowMs) || nowMs < 0 || !Number.isSafeInteger(staleAfterMs) || staleAfterMs < 0) throw new Error("invalid stale binding candidate time")
+		return this.db.transaction(() => {
+			const current = this.db.query(`SELECT b.root_session_id AS rootSessionId,b.owner_instance AS ownerInstance,b.binding_revision AS bindingRevision,b.updated_at AS bindingUpdatedAt,
+				i.endpoint,i.instance_token AS instanceToken,i.instance_revision AS instanceRevision,i.heartbeat_ms AS observedHeartbeatMs
+				FROM bindings b JOIN instances i ON i.instance_id=b.owner_instance
+				WHERE b.active=1 ORDER BY b.alias`).all() as Array<Omit<BindingReapCandidate, "tokenFingerprint"> & { instanceToken: string }>
+			const candidates = current.filter((row) => nowMs - row.observedHeartbeatMs > staleAfterMs).map(({ instanceToken, ...row }) => ({ ...row, tokenFingerprint: sha256(instanceToken) }))
+			const identities = new Map(candidates.map((candidate) => [candidate.rootSessionId, candidate]))
+			for (const state of this.bindingReapStates()) {
+				const candidate = identities.get(state.rootSessionId)
+				if (!candidate || candidate.ownerInstance !== state.ownerInstance || candidate.bindingRevision !== state.bindingRevision || candidate.endpoint !== state.endpoint || candidate.tokenFingerprint !== state.tokenFingerprint || candidate.instanceRevision !== state.instanceRevision || candidate.observedHeartbeatMs !== state.observedHeartbeatMs) this.db.query("DELETE FROM binding_reap_state WHERE root_session_id=?").run(state.rootSessionId)
+			}
+			return candidates
+		})()
+	}
+	private bindingReapIdentityMatches(candidate: BindingReapCandidate): boolean {
+		const row = this.db.query(`SELECT b.owner_instance AS ownerInstance,b.binding_revision AS bindingRevision,i.endpoint,i.instance_token AS instanceToken,i.instance_revision AS instanceRevision,i.heartbeat_ms AS observedHeartbeatMs
+			FROM bindings b JOIN instances i ON i.instance_id=b.owner_instance WHERE b.root_session_id=? AND b.active=1`).get(candidate.rootSessionId) as { ownerInstance: string; bindingRevision: number; endpoint: string; instanceToken: string; instanceRevision: number; observedHeartbeatMs: number } | null
+		return Boolean(row && row.ownerInstance === candidate.ownerInstance && row.bindingRevision === candidate.bindingRevision && row.endpoint === candidate.endpoint && sha256(row.instanceToken) === candidate.tokenFingerprint && row.instanceRevision === candidate.instanceRevision && row.observedHeartbeatMs === candidate.observedHeartbeatMs)
+	}
+	bindingReapProbeTarget(candidate: BindingReapCandidate): { endpoint: string; instanceToken: string } | undefined {
+		if (!this.bindingReapIdentityMatches(candidate)) return
+		const row = this.db.query("SELECT i.endpoint,i.instance_token AS instanceToken FROM bindings b JOIN instances i ON i.instance_id=b.owner_instance WHERE b.root_session_id=? AND b.active=1").get(candidate.rootSessionId) as { endpoint: string; instanceToken: string } | null
+		return row ? { endpoint: row.endpoint, instanceToken: row.instanceToken } : undefined
+	}
+	private bindingReapStateRow(rootSessionId: string): BindingReapState | undefined {
+		const row = this.db.query(`SELECT root_session_id AS rootSessionId,owner_instance AS ownerInstance,binding_revision AS bindingRevision,binding_updated_at AS bindingUpdatedAt,
+			endpoint,token_fingerprint AS tokenFingerprint,instance_revision AS instanceRevision,observed_heartbeat_ms AS observedHeartbeatMs,consecutive_failures AS consecutiveFailures,
+			first_failure_ms AS firstFailureMs,last_failure_ms AS lastFailureMs,last_result AS lastResult,updated_at AS updatedAt
+			FROM binding_reap_state WHERE root_session_id=?`).get(rootSessionId) as BindingReapState | null
+		return row ?? undefined
+	}
+	bindingReapState(rootSessionId: string): BindingReapState | undefined { return this.bindingReapStateRow(rootSessionId) }
+	bindingReapStates(): BindingReapState[] {
+		return this.db.query(`SELECT root_session_id AS rootSessionId,owner_instance AS ownerInstance,binding_revision AS bindingRevision,binding_updated_at AS bindingUpdatedAt,
+			endpoint,token_fingerprint AS tokenFingerprint,instance_revision AS instanceRevision,observed_heartbeat_ms AS observedHeartbeatMs,consecutive_failures AS consecutiveFailures,
+			first_failure_ms AS firstFailureMs,last_failure_ms AS lastFailureMs,last_result AS lastResult,updated_at AS updatedAt
+			FROM binding_reap_state ORDER BY root_session_id`).all() as BindingReapState[]
+	}
+	recordBindingReapFailure(candidate: BindingReapCandidate, result: string, observedAtMs = Date.now()): { state: BindingReapState | undefined; recorded: boolean } {
+		if (!result || result.length > 200 || /[\u0000-\u001f\u007f]/.test(result) || !Number.isSafeInteger(observedAtMs) || observedAtMs < 0) throw new Error("invalid binding reap failure")
+		return this.db.transaction(() => {
+			if (!this.bindingReapIdentityMatches(candidate)) { this.db.query("DELETE FROM binding_reap_state WHERE root_session_id=?").run(candidate.rootSessionId); return { state: undefined, recorded: false } }
+			const state = this.bindingReapStateRow(candidate.rootSessionId)
+			const sameIdentity = state && state.ownerInstance === candidate.ownerInstance && state.bindingRevision === candidate.bindingRevision && state.endpoint === candidate.endpoint && state.tokenFingerprint === candidate.tokenFingerprint && state.instanceRevision === candidate.instanceRevision && state.observedHeartbeatMs === candidate.observedHeartbeatMs
+			if (sameIdentity && observedAtMs - state.lastFailureMs < BINDING_REAP_PROBE_SPACING_MS) return { state, recorded: false }
+			const firstFailureMs = sameIdentity ? state.firstFailureMs : observedAtMs, consecutiveFailures = sameIdentity ? state.consecutiveFailures + 1 : 1, updatedAt = new Date(observedAtMs).toISOString()
+			this.db.query(`INSERT OR REPLACE INTO binding_reap_state(root_session_id,owner_instance,binding_revision,binding_updated_at,endpoint,token_fingerprint,instance_revision,observed_heartbeat_ms,consecutive_failures,first_failure_ms,last_failure_ms,last_result,updated_at)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(candidate.rootSessionId, candidate.ownerInstance, candidate.bindingRevision, candidate.bindingUpdatedAt, candidate.endpoint, candidate.tokenFingerprint, candidate.instanceRevision, candidate.observedHeartbeatMs, consecutiveFailures, firstFailureMs, observedAtMs, result, updatedAt)
+			return { state: this.bindingReapStateRow(candidate.rootSessionId), recorded: true }
+		})()
+	}
+	clearBindingReapState(candidate: BindingReapCandidate): boolean {
+		return this.db.query("DELETE FROM binding_reap_state WHERE root_session_id=? AND owner_instance=? AND binding_revision=? AND endpoint=? AND token_fingerprint=? AND instance_revision=? AND observed_heartbeat_ms=?").run(candidate.rootSessionId, candidate.ownerInstance, candidate.bindingRevision, candidate.endpoint, candidate.tokenFingerprint, candidate.instanceRevision, candidate.observedHeartbeatMs).changes === 1
+	}
+	deactivateStaleBinding(candidate: BindingReapCandidate, currentRunObservations: number): boolean {
+		if (!Number.isSafeInteger(currentRunObservations) || currentRunObservations < 2) return false
+		return this.db.transaction(() => {
+			if (!this.bindingReapIdentityMatches(candidate)) return false
+			const state = this.bindingReapStateRow(candidate.rootSessionId)
+			if (!state || state.ownerInstance !== candidate.ownerInstance || state.bindingRevision !== candidate.bindingRevision || state.endpoint !== candidate.endpoint || state.tokenFingerprint !== candidate.tokenFingerprint || state.instanceRevision !== candidate.instanceRevision || state.observedHeartbeatMs !== candidate.observedHeartbeatMs || state.consecutiveFailures < BINDING_REAP_FAILURE_THRESHOLD || state.lastFailureMs - state.firstFailureMs < BINDING_REAP_FAILURE_SPAN_MS) return false
+			if (!this.deactivateBindingInternal(candidate.rootSessionId, candidate.ownerInstance)) return false
+			this.audit("stale-owner-probe-threshold")
+			return true
+		})()
+	}
+	deactivateDefinitiveNotRoot(candidate: BindingReapCandidate): boolean {
+		return this.db.transaction(() => {
+			if (!this.bindingReapIdentityMatches(candidate) || !this.deactivateBindingInternal(candidate.rootSessionId, candidate.ownerInstance)) return false
+			this.audit("stale-owner-probe-not-root")
+			return true
+		})()
 	}
 	refreshRoute(conversationId: string, contextToken: string): void { this.db.query("UPDATE global_route SET conversation_id=?,context_token=?,updated_at=? WHERE singleton=1").run(conversationId, contextToken, new Date().toISOString()) }
 	route(): GlobalRoute { return this.db.query("SELECT conversation_id AS conversationId,context_token AS contextToken,updated_at AS updatedAt FROM global_route WHERE singleton=1").get() as GlobalRoute }

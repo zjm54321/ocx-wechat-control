@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import { createCallbackHandler } from "./client"
 import type { ControlResult, V2ControlClient } from "./control-client"
+import { STALE_REAPER_PROOF_DOMAIN, STALE_REAPER_PROOF_VERSION, signStaleReaperRequest, verifyStaleReaperResponse } from "./stale-reaper-auth"
 
 const ok = (data: unknown, status = 200): ControlResult => ({ data, error: undefined, status })
 const legacy = { session: { get: async () => ({ data: { id: "root" } }), prompt: async () => ({}) } }
@@ -27,6 +28,7 @@ class FakeControlClient implements V2ControlClient {
 function request(path: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal): Request {
 	return new Request(`http://127.0.0.1${path}`, { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret", "x-wechat-instance-token": "token", ...headers }, body: JSON.stringify(body), signal })
 }
+function probeRequest(body: unknown): Request { return new Request("http://127.0.0.1/health", { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": "secret" }, body: JSON.stringify(body) }) }
 
 function handler(client: V2ControlClient, directory = "d"): (request: Request) => Promise<Response> { return createCallbackHandler(legacy, "secret", "token", client, directory) }
 
@@ -83,4 +85,15 @@ test("legacy inject is gone and cannot mutate session state", async () => {
 	const legacyClient = { session: { get: async () => { gets++; return { data: { id: "root" } } }, prompt: async () => { prompts++; return {} } } }
 	const response = await createCallbackHandler(legacyClient, "secret", "token", new FakeControlClient(), "d")(request("/inject", { rootSessionId: "root", directory: "d", inboundId: "in", text: "do not inject", envelope: { kind: "inbound" } }))
 	expect(response.status).toBe(410); expect(await response.json()).toEqual({ error: "legacy-inject-removed" }); expect(gets).toBe(0); expect(prompts).toBe(0)
+})
+
+test("stale reaper callback signs authenticated exact-root ok and not-root outcomes", async () => {
+	const client = new FakeControlClient(), run = handler(client), challenge = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", proof = await signStaleReaperRequest("token", challenge, "root")
+	const okResponse = await run(probeRequest({ proofDomain: STALE_REAPER_PROOF_DOMAIN, proofVersion: STALE_REAPER_PROOF_VERSION, challenge, rootSessionId: "root", requestProof: proof })); expect(okResponse.status).toBe(200); const okBody = await okResponse.json() as any; expect(okBody).toMatchObject({ ok: true, outcome: "ok", challenge, rootSessionId: "root" }); expect(await verifyStaleReaperResponse("token", challenge, "root", "ok", okBody.responseProof)).toBe(true)
+	client.sessions.set("child-root", { id: "child-root", parentID: "root" }); const childProof = await signStaleReaperRequest("token", challenge, "child-root"), notRoot = await run(probeRequest({ proofDomain: STALE_REAPER_PROOF_DOMAIN, proofVersion: STALE_REAPER_PROOF_VERSION, challenge, rootSessionId: "child-root", requestProof: childProof })); expect(notRoot.status).toBe(409); const notRootBody = await notRoot.json() as any; expect(notRootBody).toMatchObject({ error: "not-root", outcome: "not-root" }); expect(await verifyStaleReaperResponse("token", challenge, "child-root", "not-root", notRootBody.responseProof)).toBe(true)
+})
+
+test("stale reaper request proof is required before exact-root lookup", async () => {
+	let lookups = 0; const client = { session: { get: async () => { lookups++; return { data: { id: "root" } } }, prompt: async () => ({}) } }, run = createCallbackHandler(client, "secret", "token")
+	const response = await run(probeRequest({ proofDomain: STALE_REAPER_PROOF_DOMAIN, proofVersion: STALE_REAPER_PROOF_VERSION, challenge: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", rootSessionId: "root" })); expect(response.status).toBe(401); expect(lookups).toBe(0)
 })

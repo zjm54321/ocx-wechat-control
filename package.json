@@ -1,6 +1,6 @@
 {
   "name": "@mingzzz/ocx-wechat-control",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Restricted WeChat takeover plugin for OpenCode",
   "type": "module",
   "main": "./dist/index.js",
@@ -20,7 +20,7 @@
   "scripts": {
     "build": "bun build ./src/index.ts ./src/worker.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk --external @opencode-ai/sdk/v2/client",
     "test": "bun test ./src/core.test.ts ./src/typing.test.ts",
-    "test:broker": "bun test ./src/broker-flow.test.ts",
+    "test:broker": "bun test ./src/broker-flow.test.ts ./src/stale-reaper.test.ts",
     "test:callbacks": "bun test ./src/client-callback.test.ts ./src/worker-compat.test.ts ./src/worker-shutdown.test.ts ./src/plugin-startup.test.ts ./src/plugin-native.test.ts ./src/plugin-lifecycle.test.ts ./src/plugin-reply.test.ts",
     "test:integration": "bun test ./src/phase1f.integration.test.ts",
     "test:dist": "bun test ./src/dist-entry.test.ts",

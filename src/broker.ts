@@ -1,7 +1,8 @@
 import type { WeChatAdapter } from "./adapter"
 import type { TypingCoordinator } from "./typing"
-import { CONTROL_OFF_TEXT, HELP_TEXT, OFFLINE_TEXT, PERMISSION_DENIED_TEXT, REQUEST_CODE_PATTERN, SerialQueue, Store, boundedJson, formatOutbound, formatRegistrationList, isPlainText, isValidRouteMetadata, parseInboundText, type Binding, type NativeRequest, type NativeRequestKind, type RoutedBinding, type WeixinInbound } from "./core"
+import { CONTROL_OFF_TEXT, HELP_TEXT, OFFLINE_TEXT, PERMISSION_DENIED_TEXT, REQUEST_CODE_PATTERN, SerialQueue, Store, boundedJson, formatOutbound, formatRegistrationList, isPlainText, isValidRouteMetadata, parseInboundText, type Binding, type BindingReapCandidate, type NativeRequest, type NativeRequestKind, type RoutedBinding, type WeixinInbound } from "./core"
 import type { WorkerMetadata } from "./worker-protocol"
+import { STALE_REAPER_PROOF_DOMAIN, STALE_REAPER_PROOF_VERSION, createStaleReaperChallenge, signStaleReaperRequest, validStaleReaperChallenge, validStaleReaperProof, verifyStaleReaperResponse, type StaleReaperOutcome } from "./stale-reaper-auth"
 
 type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
 type JsonObject = Record<string, unknown>
@@ -9,6 +10,10 @@ type RuntimeSnapshot = ReturnType<Store["activeRuntimeSnapshots"]>[number]
 export const DEFAULT_CALLBACK_TIMEOUT_MS = 10 * 60_000
 export const MIN_CALLBACK_TIMEOUT_MS = 30_000
 export const MAX_CALLBACK_TIMEOUT_MS = 10 * 60_000
+export const STALE_REAPER_GRACE_MS = 60_000
+export const STALE_REAPER_CONTINUITY_MS = 60_000
+export const STALE_REAPER_PROBE_TIMEOUT_MS = 3_000
+export const STALE_REAPER_CONCURRENCY = 3
 const MAX_NATIVE_QUESTIONS = 16
 const MAX_NATIVE_OPTIONS = 32
 const MAX_NATIVE_FIELD = 1000
@@ -18,7 +23,23 @@ const NATIVE_INVALID_TEXT = "请求编号无效或已过期，请按当前会话
 const NATIVE_CROSS_ROOT_TEXT = "该请求属于另一个当前会话；请使用对应的会话编号和请求编号。"
 
 export function clampCallbackTimeout(value?: number): number { return Math.min(MAX_CALLBACK_TIMEOUT_MS, Math.max(MIN_CALLBACK_TIMEOUT_MS, value ?? DEFAULT_CALLBACK_TIMEOUT_MS)) }
-export interface BrokerOptions { callbackTimeoutMs?: number; typing?: TypingCoordinator; workerMetadata?: WorkerMetadata }
+export interface BrokerOptions { callbackTimeoutMs?: number; typing?: TypingCoordinator; workerMetadata?: WorkerMetadata; now?: () => number; staleProbeTimeoutMs?: number; staleProbeConcurrency?: number }
+
+export interface StaleReaperCycle {
+	inGrace: boolean
+	continuityGap: boolean
+	candidates: number
+	probed: number
+	deactivated: number
+}
+
+export interface StaleBindingReaperOptions {
+	now?: () => number
+	probeTimeoutMs?: number
+	concurrency?: number
+	onDeactivate?: () => void
+	challenge?: () => string
+}
 
 export interface NativeQuestion {
 	question: string
@@ -34,6 +55,80 @@ function validId(value: unknown): value is string { return typeof value === "str
 function boundedText(value: unknown, max = MAX_NATIVE_FIELD): value is string { return typeof value === "string" && value.length > 0 && value.length <= max && isPlainText(value) }
 function isLoopbackEndpoint(value: unknown): value is string { if (typeof value !== "string") return false; try { const url = new URL(value); return url.protocol === "http:" && url.hostname === "127.0.0.1" } catch { return false } }
 function callbackHeaders(secret: string, token: string): HeadersInit { return { "content-type": "application/json", "x-wechat-control-key": secret, "x-wechat-instance-token": token } }
+
+function reapIdentity(candidate: BindingReapCandidate): string {
+	return JSON.stringify([candidate.rootSessionId, candidate.ownerInstance, candidate.bindingRevision, candidate.endpoint, candidate.tokenFingerprint, candidate.instanceRevision, candidate.observedHeartbeatMs])
+}
+
+export class StaleBindingReaper {
+	private readonly now: () => number
+	private readonly probeTimeoutMs: number
+	private readonly concurrency: number
+	private readonly onDeactivate: () => void
+	private readonly challenge: () => string
+	private graceUntilMs = 0
+	private lastMaintenanceMs?: number
+	private readonly currentRunObservations = new Map<string, number>()
+	private running?: Promise<StaleReaperCycle>
+	constructor(private readonly store: Store, private readonly sharedSecret: string, private readonly fetcher: Fetch = fetch, options: StaleBindingReaperOptions = {}) {
+		this.now = options.now ?? Date.now
+		this.probeTimeoutMs = Math.max(1, options.probeTimeoutMs ?? STALE_REAPER_PROBE_TIMEOUT_MS)
+		this.concurrency = Math.max(1, Math.floor(options.concurrency ?? STALE_REAPER_CONCURRENCY))
+		this.onDeactivate = options.onDeactivate ?? (() => {})
+		this.challenge = options.challenge ?? createStaleReaperChallenge
+		this.start()
+	}
+	start(nowMs = this.now()): void { this.currentRunObservations.clear(); this.graceUntilMs = nowMs + STALE_REAPER_GRACE_MS; this.lastMaintenanceMs = nowMs }
+	run(nowMs = this.now()): Promise<StaleReaperCycle> {
+		if (this.running) return this.running
+		const current = this.runCycle(nowMs).finally(() => { if (this.running === current) this.running = undefined })
+		this.running = current
+		return current
+	}
+	private async runCycle(nowMs: number): Promise<StaleReaperCycle> {
+		const continuityGap = this.lastMaintenanceMs !== undefined && nowMs - this.lastMaintenanceMs > STALE_REAPER_CONTINUITY_MS
+		if (continuityGap) { this.currentRunObservations.clear(); this.graceUntilMs = nowMs + STALE_REAPER_GRACE_MS }
+		this.lastMaintenanceMs = nowMs
+		const candidates = this.store.staleBindingCandidates(nowMs), identities = new Set(candidates.map(reapIdentity))
+		for (const identity of this.currentRunObservations.keys()) if (!identities.has(identity)) this.currentRunObservations.delete(identity)
+		if (nowMs < this.graceUntilMs) return { inGrace: true, continuityGap, candidates: candidates.length, probed: 0, deactivated: 0 }
+		let index = 0, probed = 0, deactivated = 0
+		const worker = async () => {
+			while (index < candidates.length) {
+				const candidate = candidates[index++], identity = reapIdentity(candidate), target = this.store.bindingReapProbeTarget(candidate)
+				if (!target) { this.currentRunObservations.delete(identity); continue }
+				probed++
+				const result = await this.probe(candidate, target)
+				if (result === "live") { this.store.clearBindingReapState(candidate); this.currentRunObservations.delete(identity); continue }
+				if (result === "not-root") {
+					this.currentRunObservations.delete(identity)
+					if (this.store.deactivateDefinitiveNotRoot(candidate)) { deactivated++; this.onDeactivate() }
+					continue
+				}
+				const recorded = this.store.recordBindingReapFailure(candidate, result, nowMs)
+				if (!recorded.recorded) { if (!recorded.state) this.currentRunObservations.delete(identity); continue }
+				const observations = (this.currentRunObservations.get(identity) ?? 0) + 1
+				this.currentRunObservations.set(identity, observations)
+				if (this.store.deactivateStaleBinding(candidate, observations)) { this.currentRunObservations.delete(identity); deactivated++; this.onDeactivate() }
+			}
+		}
+		await Promise.all(Array.from({ length: Math.min(this.concurrency, candidates.length) }, worker))
+		return { inGrace: false, continuityGap, candidates: candidates.length, probed, deactivated }
+	}
+	private async probe(candidate: BindingReapCandidate, target: { endpoint: string; instanceToken: string }): Promise<string> {
+		try {
+			const challenge = this.challenge()
+			if (!validStaleReaperChallenge(challenge)) return "invalid-challenge"
+			const requestProof = await signStaleReaperRequest(target.instanceToken, challenge, candidate.rootSessionId)
+			const response = await this.fetcher(`${target.endpoint}/health`, { method: "POST", headers: { "content-type": "application/json", "x-wechat-control-key": this.sharedSecret }, body: JSON.stringify({ proofDomain: STALE_REAPER_PROOF_DOMAIN, proofVersion: STALE_REAPER_PROOF_VERSION, challenge, rootSessionId: candidate.rootSessionId, requestProof }), signal: AbortSignal.timeout(this.probeTimeoutMs) })
+			let body: JsonObject | undefined
+			try { body = object(await response.json()) } catch { return "malformed" }
+			const outcome: StaleReaperOutcome | undefined = response.status === 200 && body?.ok === true && body?.outcome === "ok" ? "ok" : response.status === 409 && body?.error === "not-root" && body?.outcome === "not-root" ? "not-root" : undefined
+			if (outcome && body && body.proofDomain === STALE_REAPER_PROOF_DOMAIN && body.proofVersion === STALE_REAPER_PROOF_VERSION && body.challenge === challenge && body.rootSessionId === candidate.rootSessionId && validStaleReaperProof(body.responseProof) && await verifyStaleReaperResponse(target.instanceToken, challenge, candidate.rootSessionId, outcome, body.responseProof)) return outcome === "ok" ? "live" : "not-root"
+			return response.status === 401 || response.status === 403 ? "auth-failed" : "unavailable"
+		} catch (error) { return error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "unavailable" }
+	}
+}
 
 function parseQuestionPayload(value: unknown): NativeQuestionPayload | undefined {
 	const payload = object(value)
@@ -128,11 +223,14 @@ export class BrokerService {
 	private readonly callbackTimeoutMs: number
 	private readonly typing?: TypingCoordinator
 	private readonly workerMetadata?: WorkerMetadata
-	constructor(readonly store: Store, readonly adapter: WeChatAdapter, readonly sharedSecret: string, readonly workerToken: string, private readonly fetcher: Fetch = fetch, options: BrokerOptions = {}) { this.callbackTimeoutMs = clampCallbackTimeout(options.callbackTimeoutMs); this.typing = options.typing; this.workerMetadata = options.workerMetadata }
+	private readonly staleReaper: StaleBindingReaper
+	constructor(readonly store: Store, readonly adapter: WeChatAdapter, readonly sharedSecret: string, readonly workerToken: string, private readonly fetcher: Fetch = fetch, options: BrokerOptions = {}) { this.callbackTimeoutMs = clampCallbackTimeout(options.callbackTimeoutMs); this.typing = options.typing; this.workerMetadata = options.workerMetadata; this.staleReaper = new StaleBindingReaper(store, sharedSecret, fetcher, { now: options.now, probeTimeoutMs: options.staleProbeTimeoutMs, concurrency: options.staleProbeConcurrency, onDeactivate: () => this.refreshTyping() }) }
 	start(): string { if (this.server) return this.server.url.toString(); this.server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => this.handleRequest(request) }); return this.server.url.toString() }
 	stop(): void { this.server?.stop(); this.server = undefined; this.adapter.stop() }
 	async startAdapter(): Promise<void> { await this.adapter.start(async (message) => { await this.handleInbound(message) }) }
 	async drainBackground(): Promise<void> { await Promise.all([...this.background]) }
+	startStaleBindingReaper(now?: number): void { this.staleReaper.start(now) }
+	reapStaleBindings(now?: number): Promise<StaleReaperCycle> { return this.staleReaper.run(now) }
 	async reconcileActiveRuntimes(now = Date.now(), leaseMs?: number): Promise<void> {
 		const snapshots = this.store.activeRuntimeSnapshots(), groups = new Map<string, typeof snapshots>()
 		for (const snapshot of snapshots) { const key = JSON.stringify([snapshot.ownerInstance, snapshot.directory, snapshot.endpoint, snapshot.instanceToken]); const group = groups.get(key) ?? []; group.push(snapshot); groups.set(key, group) }
@@ -181,8 +279,8 @@ export class BrokerService {
 		}
 		if (!validId(body.instanceId) || !validId(body.instanceToken)) return Response.json({ error: "instance-unauthorized" }, { status: 403 })
 		if (body.method === "unregister") { const ok = this.store.unregister(body.instanceId, body.instanceToken); if (ok) this.refreshTyping(); return Response.json({ ok }) }
+		if (body.method === "heartbeat") { const ok = this.store.touch(body.instanceId, body.instanceToken); return ok ? Response.json({ ok: true }) : Response.json({ error: "instance-unauthorized" }, { status: 403 }) }
 		if (!this.store.authenticate(body.instanceId, body.instanceToken)) return Response.json({ error: "instance-unauthorized" }, { status: 403 })
-		if (body.method === "heartbeat") return Response.json({ ok: this.store.touch(body.instanceId, body.instanceToken) })
 		if (body.method === "bind-current") return Response.json({ error: "deprecated-manual-binding" }, { status: 410 })
 		if (body.method === "leave-root") {
 			if (!validId(body.rootSessionId) || typeof body.directory !== "string" || !body.directory || body.directory.length > 32_767 || (body.title !== null && body.title !== undefined && (typeof body.title !== "string" || body.title.length > 1000))) return Response.json({ error: "invalid-registration" }, { status: 400 })
@@ -369,7 +467,7 @@ export class BrokerService {
 	private refreshTyping(): void { try { this.typing?.refresh() } catch {} }
 	private reassertTyping(): void { try { this.typing?.reassert() } catch {} }
 	private async dispatchControl(outboundId: string, binding: RoutedBinding, payload: string): Promise<void> { try { this.store.recordEcho(binding.conversationId, binding.contextToken, payload); await this.adapter.send(binding.conversationId, payload, binding.contextToken); this.store.finishControlOutbound(outboundId, true) } catch { this.store.finishControlOutbound(outboundId, false) } }
-	private async callbackHealth(endpoint: string, token: string, rootSessionId?: string): Promise<"ok" | "not-root" | "unavailable"> { try { const response = await this.fetcher(`${endpoint}/health`, { method: "POST", headers: callbackHeaders(this.sharedSecret, token), body: JSON.stringify({ rootSessionId }), signal: AbortSignal.timeout(3000) }); if (response.ok) return "ok"; const body = object(await response.json()); return body?.error === "not-root" ? "not-root" : "unavailable" } catch { return "unavailable" } }
+	private async callbackHealth(endpoint: string, token: string, rootSessionId?: string): Promise<"ok" | "not-root" | "unavailable"> { try { const response = await this.fetcher(`${endpoint}/health`, { method: "POST", headers: callbackHeaders(this.sharedSecret, token), body: JSON.stringify({ rootSessionId }), signal: AbortSignal.timeout(3000) }); const body = object(await response.json()); if (response.status === 200 && body?.ok === true) return "ok"; return response.status === 409 && body?.error === "not-root" ? "not-root" : "unavailable" } catch { return "unavailable" } }
 	private async safeSystemReply(message: WeixinInbound, kind: string, text: string): Promise<void> { const claim = this.store.claimSystemOutbound(message, kind, text); if (!claim) return; try { this.store.recordEcho(message.fromUserId, message.contextToken, text); await this.adapter.send(message.fromUserId, text, message.contextToken); this.store.finishControlOutbound(claim.outboundId, true) } catch { this.store.finishControlOutbound(claim.outboundId, false) } }
 }
 

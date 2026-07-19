@@ -6,7 +6,7 @@ import * as path from "node:path"
 import { AdapterSendError, assertWeixinSendSuccess, JsonRpcPendingMap, MockWeChatAdapter, WeixinMcpAdapter, type McpClient } from "./adapter"
 import { BrokerService, clampCallbackTimeout } from "./broker"
 import { ClientLifecycleRegistry, createCallbackHandler, resolveRootSession } from "./client"
-import { CONTROL_OFF_TEXT, HELP_TEXT, MAX_CONTEXT_TOKEN_LENGTH, MAX_ROUTE_ID_LENGTH, PERMISSION_DENIED_TEXT, Store, allocateRequestCode, formatOutbound, formatRegistrationList, parseInboundText, parsePollToolResult, sanitizeTitle } from "./core"
+import { CONTROL_OFF_TEXT, HELP_TEXT, MAX_CONTEXT_TOKEN_LENGTH, MAX_ROUTE_ID_LENGTH, PERMISSION_DENIED_TEXT, Store, allocateRequestCode, formatOutbound, formatRegistrationList, parseInboundText, parsePollToolResult, sanitizeTitle, sha256 } from "./core"
 import { runWorker } from "./worker"
 import { decideExistingBroker, pidStatus, readLock } from "./worker-runtime"
 import { captureReplyCallID, createControlCommandHook, createControlEventHook, createPermissionHook, registerControlCommands, resolveWeixinCommand } from "./plugin-runtime"
@@ -73,7 +73,7 @@ test("v6 to v7 preserves durable outbound history and conservatively backfills l
 	legacy.query("INSERT INTO control_outbound VALUES('generated','wechat-reply:root:one','root','wechat-reply','SENT','#10\nbody','user','ctx','now'),('noncanonical','wechat-reply:root:two','root','wechat-reply','UNKNOWN','#010\nbody','user','ctx','now'),('bad-key','wechat-reply:root:','root','wechat-reply','SENT','#10\nbody','user','ctx','now'),('wrong-root','wechat-reply:other:three','root','wechat-reply','SENT','#10\nbody','user','ctx','now'),('other','other','root','permission','SENT','#10\nbody','user','ctx','now')").run()
 	legacy.query("INSERT INTO outbound_echoes VALUES('echo','user','ctx','#10\nbody',?,'now')").run(expires); legacy.close()
 	const store = new Store(filename), backup = store.migrationBackupPath
-	expect(backup).toContain("pre-v7"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7)
+	expect(backup).toContain("pre-v7"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8)
 	expect(store.bindingForRoot("root")).toMatchObject({ alias: 1, registrationAlias: 10 })
 	expect(store.db.query("SELECT outbound_id AS id,state,payload,logical_text AS text,logical_hash AS hash FROM control_outbound ORDER BY outbound_id").all()).toEqual([
 		{ id: "bad-key", state: "SENT", payload: "#10\nbody", text: null, hash: null },
@@ -321,7 +321,7 @@ function createWalV2(filename: string): Database {
 
 test("WAL-consistent legacy-to-v5 snapshot preserves registrations and sequence", () => {
 	const filename = tempFile("wal-v2"), writer = createWalV2(filename), store = new Store(filename); const backup = store.migrationBackupPath
-	expect(backup).toBeDefined(); expect(backup).toContain("pre-v5"); expect(store.bindingForRoot("root-wal")).toMatchObject({ alias: 1, registrationAlias: 7 }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect(store.control()).toEqual({ enabled: false, revision: 0 }); expect(store.route()).toMatchObject({ conversationId: "conversation-wal", contextToken: null })
+	expect(backup).toBeDefined(); expect(backup).toContain("pre-v5"); expect(store.bindingForRoot("root-wal")).toMatchObject({ alias: 1, registrationAlias: 7 }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8); expect(store.control()).toEqual({ enabled: false, revision: 0 }); expect(store.route()).toMatchObject({ conversationId: "conversation-wal", contextToken: null })
 	expect((store.db.query("PRAGMA table_info(session_activity)").all() as any[]).map((row) => row.name)).toContain("epoch"); expect((store.db.query("PRAGMA table_info(checkpoints)").all() as any[]).map((row) => row.name)).toContain("request_key"); expect((store.db.query("PRAGMA table_info(outbound_echoes)").all() as any[]).map((row) => row.name)).toContain("expires_ms")
 	const snapshot = new Database(backup!); expect((snapshot.query("SELECT value FROM meta WHERE key='custom'").get() as any).value).toBe("wal-data"); expect((snapshot.query("SELECT conversation_id AS value FROM bindings WHERE alias=7").get() as any).value).toBe("conversation-wal"); expect(snapshot.query("SELECT 1 FROM pending_replies WHERE inbound_id='pending-wal'").get()).toBeDefined(); snapshot.close()
 	expect(store.bind({ rootSessionId: "root-two", directory: "d", ownerInstance: "owner" })).toMatchObject({ alias: 2, registrationAlias: 8 })
@@ -342,9 +342,9 @@ function createWalV4(filename: string): Database {
 
 test("v4-to-v5 migration snapshots once and preserves alias sequence", () => {
 	const filename = tempFile("wal-v4"), writer = createWalV4(filename), store = new Store(filename), backup = store.migrationBackupPath
-	expect(backup).toContain("pre-v5"); expect(store.bindingForRoot("root-v4")).toMatchObject({ alias: 1, registrationAlias: 12, directory: "dir-v4", ownerInstance: "owner-v4", title: null }); expect(store.route()).toMatchObject({ conversationId: "recipient-v4", contextToken: null }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7)
+	expect(backup).toContain("pre-v5"); expect(store.bindingForRoot("root-v4")).toMatchObject({ alias: 1, registrationAlias: 12, directory: "dir-v4", ownerInstance: "owner-v4", title: null }); expect(store.route()).toMatchObject({ conversationId: "recipient-v4", contextToken: null }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8)
 	expect(store.bind({ rootSessionId: "next-v5", directory: "d", ownerInstance: "o" })).toMatchObject({ alias: 2, registrationAlias: 13 }); store.close(); writer.close()
-	const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect((reopened.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("7"); reopened.close(); cleanup(filename, backup)
+	const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect((reopened.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("8"); reopened.close(); cleanup(filename, backup)
 })
 
 test("v4 multiple conversations migrate fail-closed and alias holes advance from max", () => {
@@ -356,7 +356,7 @@ test("v4 multiple conversations migrate fail-closed and alias holes advance from
 
 test("old deployed v3 receives a pre-v5 snapshot and preserves control/pending/checkpoint data", () => {
 	const filename = tempFile("wal-v3"), writer = createWalV3(filename), store = new Store(filename), backup = store.migrationBackupPath
-	expect(backup).toContain("pre-v5"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect(store.bindingForRoot("root-v3")).toMatchObject({ alias: 1, registrationAlias: 4 }); expect(store.control()).toEqual({ enabled: true, revision: 17 }); expect(store.pendingState("in-v3")).toBe("UNKNOWN"); expect(store.checkpointState("cp-v3")).toBe("CANCELLED"); expect(store.checkpointForRequest("cp-v3", "root-v3")?.checkpointId).toBe("cp-v3")
+	expect(backup).toContain("pre-v5"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8); expect(store.bindingForRoot("root-v3")).toMatchObject({ alias: 1, registrationAlias: 4 }); expect(store.control()).toEqual({ enabled: true, revision: 17 }); expect(store.pendingState("in-v3")).toBe("UNKNOWN"); expect(store.checkpointState("cp-v3")).toBe("CANCELLED"); expect(store.checkpointForRequest("cp-v3", "root-v3")?.checkpointId).toBe("cp-v3")
 	const snapshot = new Database(backup!); expect((snapshot.query("PRAGMA user_version").get() as any).user_version).toBe(3); expect((snapshot.query("SELECT revision FROM control_state").get() as any).revision).toBe(17); expect((snapshot.query("SELECT state FROM pending_replies WHERE inbound_id='in-v3'").get() as any).state).toBe("UNKNOWN"); expect((snapshot.query("SELECT state FROM checkpoints WHERE checkpoint_id='cp-v3'").get() as any).state).toBe("UNKNOWN"); snapshot.close()
 	store.close(); writer.close(); const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect(reopened.control().revision).toBe(17); reopened.close(); cleanup(filename, backup)
 })
@@ -641,21 +641,117 @@ test("plugin implementation remains metadata-only and adapter command is configu
 	expect(resolveWeixinCommand(["node", path.resolve("custom", "weixin-mcp", "dist", "cli.js")])[0]).toBe("node"); expect(() => resolveWeixinCommand(["npx", "weixin-mcp"])).toThrow()
 })
 
-test("clean schema v7 has bounded state tables, metadata and AUTOINCREMENT holes", () => {
+test("clean schema v8 has bounded state tables, metadata and AUTOINCREMENT holes", () => {
 	const store = new Store(":memory:")
-	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect((store.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("7")
-	for (const table of ["prompt_submissions", "native_requests", "root_runtime", "typing_state"]) expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)).toBeDefined()
+	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8); expect((store.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("8")
+	for (const table of ["prompt_submissions", "native_requests", "root_runtime", "typing_state", "binding_reap_state"]) expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)).toBeDefined()
 	store.bind({ rootSessionId: "one", directory: "d", ownerInstance: "o" }); store.bind({ rootSessionId: "hole", directory: "d", ownerInstance: "o" }); store.db.query("DELETE FROM bindings WHERE root_session_id='hole'").run(); expect(store.bind({ rootSessionId: "three", directory: "d", ownerInstance: "o" })).toMatchObject({ alias: 2, registrationAlias: 3 })
 	expect(() => store.db.query("UPDATE typing_state SET desired=2").run()).toThrow(); store.close()
 })
 
-test("existing schema v7 idempotently creates native answer guard storage", () => {
+test("existing schema v8 reopens idempotently and creates missing storage", () => {
 	const filename = tempFile("v7-native-answer-guards"); let store = new Store(filename)
 	store.db.exec("DROP TABLE native_answer_guards"); store.close(); store = new Store(filename)
-	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7)
+	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8)
 	expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_answer_guards'").get()).toBeDefined()
 	expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_native_answer_guard_request'").get()).toBeDefined()
 	store.close(); cleanup(filename)
+})
+
+function createIndependentV7Fixture(filename: string): Database {
+	const db = new Database(filename)
+	db.exec(`PRAGMA user_version=7;
+CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE instances(instance_id TEXT PRIMARY KEY,endpoint TEXT NOT NULL,instance_token TEXT NOT NULL,heartbeat_ms INTEGER NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE bindings(alias INTEGER PRIMARY KEY AUTOINCREMENT,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,title TEXT,active INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE inbound(message_id TEXT PRIMARY KEY,from_user_id TEXT NOT NULL,context_token TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,root_session_id TEXT,prompt_message_id TEXT,reason TEXT,updated_at TEXT NOT NULL);
+CREATE TABLE pending_replies(inbound_id TEXT PRIMARY KEY,root_session_id TEXT NOT NULL,prompt_message_id TEXT,alias INTEGER NOT NULL,state TEXT NOT NULL,assistant_message_id TEXT,payload TEXT,injected_at INTEGER,control_revision INTEGER NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE outbound(message_id TEXT PRIMARY KEY,inbound_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE control_state(singleton INTEGER PRIMARY KEY,enabled INTEGER NOT NULL,revision INTEGER NOT NULL);
+CREATE TABLE checkpoints(checkpoint_id TEXT PRIMARY KEY,request_key TEXT,root_session_id TEXT NOT NULL,owner_instance TEXT NOT NULL,conversation_id TEXT NOT NULL,alias INTEGER NOT NULL,question TEXT NOT NULL,choices_json TEXT NOT NULL,state TEXT NOT NULL,inbound_id TEXT,control_revision INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE session_activity(root_session_id TEXT PRIMARY KEY,owner_instance TEXT NOT NULL,running INTEGER NOT NULL,idle INTEGER NOT NULL,last_assistant_id TEXT,last_assistant_error INTEGER NOT NULL,direct_assistant_id TEXT,epoch INTEGER NOT NULL,run_id INTEGER NOT NULL,origin TEXT NOT NULL,candidate_run INTEGER,claimed_run INTEGER NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE control_outbound(outbound_id TEXT PRIMARY KEY,dedupe_key TEXT NOT NULL UNIQUE,root_session_id TEXT NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL,updated_at TEXT NOT NULL,logical_text TEXT,logical_hash TEXT);
+CREATE TABLE outbound_echoes(echo_hash TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL,payload TEXT NOT NULL,expires_ms INTEGER NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE audit(id INTEGER PRIMARY KEY,at TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE prompt_submissions(submission_id TEXT PRIMARY KEY,inbound_id TEXT NOT NULL UNIQUE,root_session_id TEXT NOT NULL,owner_instance TEXT NOT NULL,alias INTEGER NOT NULL,message_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,call_started INTEGER NOT NULL,prompt_message_id TEXT,rejection TEXT,control_revision INTEGER NOT NULL,admission_generation INTEGER,admission_finished INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE native_requests(request_id TEXT PRIMARY KEY,request_key TEXT NOT NULL UNIQUE,code TEXT NOT NULL UNIQUE,root_session_id TEXT NOT NULL,owner_instance TEXT NOT NULL,alias INTEGER NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,payload_json TEXT NOT NULL,inbound_id TEXT UNIQUE,resolution_json TEXT,control_revision INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE native_answer_guards(root_session_id TEXT NOT NULL,request_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(root_session_id,request_id));
+CREATE TABLE root_runtime(root_session_id TEXT PRIMARY KEY,owner_instance TEXT NOT NULL,status TEXT NOT NULL,generation INTEGER NOT NULL,busy_generation INTEGER,admission_count INTEGER NOT NULL,work_pending INTEGER NOT NULL,observed_ms INTEGER NOT NULL,lease_expires_ms INTEGER NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE typing_state(singleton INTEGER PRIMARY KEY,desired INTEGER NOT NULL,actual INTEGER,context_hash TEXT,attempt_ms INTEGER NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE global_route(singleton INTEGER PRIMARY KEY,conversation_id TEXT,context_token TEXT,updated_at TEXT);
+INSERT INTO meta VALUES('schema_version','7');
+INSERT INTO instances VALUES('owner','endpoint','secret-token',7,'instance-created');
+INSERT INTO bindings VALUES(9,'root','directory','owner','Title',1,'binding-created','legacy-not-a-date');
+INSERT INTO inbound VALUES('in','user','ctx','#9\nexact inbound','INJECTED','root','prompt-id',NULL,'inbound-time');
+INSERT INTO pending_replies VALUES('pending','root','prompt-id',9,'UNKNOWN','assistant-id','#9\nexact pending',123,4,'pending-time');
+INSERT INTO outbound VALUES('out','out-in','SENT','#9\nexact outbound','out-time');
+INSERT INTO control_state VALUES(1,1,4);
+INSERT INTO checkpoints VALUES('checkpoint','request-key','root','owner','user',9,'Question','["A","B"]','CANCELLED',NULL,4,'checkpoint-created','checkpoint-updated');
+INSERT INTO session_activity VALUES('root','owner',0,1,NULL,0,NULL,1,2,'NONE',NULL,0,'activity-time');
+INSERT INTO control_outbound VALUES('control','control-key','root','reply','SENT','#9\nexact control','user','ctx','control-time','exact control','logical-hash');
+INSERT INTO outbound_echoes VALUES('echo','user','ctx','#9\nexact echo',9999999999999,'echo-time');
+INSERT INTO audit VALUES(17,'audit-time','historical-audit');
+INSERT INTO prompt_submissions VALUES('submission','submission-in','root','owner',9,'submission-message','exact prompt body','SUBMITTED',1,'prompt-id',NULL,4,3,1,'submission-created','submission-updated');
+INSERT INTO native_requests VALUES('native','native-key','QABC234','root','owner',9,'QUESTION','RESOLVED','{"nested":["exact",1]}','native-in','[["answer"]]',4,'native-created','native-updated');
+INSERT INTO root_runtime VALUES('root','owner','IDLE',4,NULL,0,0,0,0,'runtime-time');
+INSERT INTO typing_state VALUES(1,0,NULL,NULL,0,'typing-time');
+INSERT INTO global_route VALUES(1,'user','ctx','route-time');`)
+	return db
+}
+
+function v7PreservationSnapshot(db: Database): Record<string, unknown> {
+	return {
+		bindings: db.query("SELECT alias,root_session_id,directory,owner_instance,title,active,created_at,updated_at FROM bindings ORDER BY alias").all(), instances: db.query("SELECT instance_id,endpoint,instance_token,heartbeat_ms,created_at FROM instances ORDER BY instance_id").all(), inbound: db.query("SELECT * FROM inbound ORDER BY message_id").all(), pending: db.query("SELECT * FROM pending_replies ORDER BY inbound_id").all(), prompt: db.query("SELECT * FROM prompt_submissions ORDER BY submission_id").all(), native: db.query("SELECT * FROM native_requests ORDER BY request_id").all(), checkpoint: db.query("SELECT * FROM checkpoints ORDER BY checkpoint_id").all(), outbound: db.query("SELECT * FROM outbound ORDER BY message_id").all(), controlOutbound: db.query("SELECT * FROM control_outbound ORDER BY outbound_id").all(), audit: db.query("SELECT * FROM audit ORDER BY id").all(), sequence: db.query("SELECT name,seq FROM sqlite_sequence ORDER BY name").all(),
+	}
+}
+
+test("independent v7 to v8 migration preserves full durable rows and populated v8 reopens idempotently", () => {
+	const filename = tempFile("v7-v8-preservation"), legacy = createIndependentV7Fixture(filename), before = v7PreservationSnapshot(legacy); legacy.close()
+	let store = new Store(filename), backup = store.migrationBackupPath; expect(backup).toContain("pre-v8"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8); expect(v7PreservationSnapshot(store.db)).toEqual(before); expect((store.db.query("SELECT binding_revision FROM bindings WHERE root_session_id='root'").get() as any).binding_revision).toBe(1); expect((store.db.query("SELECT instance_revision FROM instances WHERE instance_id='owner'").get() as any).instance_revision).toBe(1)
+	const candidate = store.staleBindingCandidates(50_000)[0], recorded = store.recordBindingReapFailure(candidate, "timeout", 1); expect(recorded.recorded).toBe(true); const reapBefore = store.bindingReapState("root"); store.close(); store = new Store(filename); expect(store.migrationBackupPath).toBeUndefined(); expect(store.bindingReapState("root")).toEqual(reapBefore); expect(v7PreservationSnapshot(store.db)).toEqual(before); store.close(); cleanup(filename, backup)
+})
+
+test("stale candidate snapshots fingerprint tokens and persist spaced inconclusive failures", () => {
+	const store = new Store(":memory:"); store.register("owner", "secret-token", "endpoint"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.db.query("UPDATE instances SET heartbeat_ms=0 WHERE instance_id='owner'").run()
+	const candidate = store.staleBindingCandidates(50_000) [0]
+	expect(candidate).toMatchObject({ rootSessionId: "root", ownerInstance: "owner", endpoint: "endpoint", observedHeartbeatMs: 0 }); expect(candidate.tokenFingerprint).toBe(sha256("secret-token")); expect(JSON.stringify(candidate)).not.toContain("secret-token")
+	expect(store.recordBindingReapFailure(candidate, "timeout", 1)).toMatchObject({ recorded: true, state: { consecutiveFailures: 1 } })
+	expect(store.recordBindingReapFailure(candidate, "refused", 2)).toMatchObject({ recorded: false, state: { consecutiveFailures: 1 } })
+	const result = store.recordBindingReapFailure(candidate, "refused", 30_001), state = result.state!
+	expect(result.recorded).toBe(true)
+	expect(state).toMatchObject({ consecutiveFailures: 2, firstFailureMs: 1, lastFailureMs: 30_001, lastResult: "refused", observedHeartbeatMs: 0 }); expect(state.updatedAt).toBe(new Date(30_001).toISOString())
+	store.touch("owner", "secret-token"); expect(store.bindingReapState("root")).toBeUndefined(); store.close()
+})
+
+test("threshold CAS requires persistent identity, spacing, current-run observations, and isolates roots", () => {
+	const store = new Store(":memory:"); store.register("owner-a", "token-a", "endpoint-a"); store.register("owner-b", "token-b", "endpoint-b"); store.bind({ rootSessionId: "root-a", directory: "a", ownerInstance: "owner-a" }); store.bind({ rootSessionId: "root-b", directory: "b", ownerInstance: "owner-b" }); store.db.query("UPDATE instances SET heartbeat_ms=0").run()
+	const [a, b] = store.staleBindingCandidates(50_000); for (const time of [0, 30_000, 60_000, 90_000, 120_000]) expect(store.recordBindingReapFailure(a, "timeout", time)).toMatchObject({ recorded: true, state: { consecutiveFailures: time / 30_000 + 1 } })
+	expect(store.deactivateStaleBinding(a, 1)).toBe(false); expect(store.deactivateStaleBinding(b, 2)).toBe(false); expect(store.deactivateStaleBinding(a, 2)).toBe(true); expect(store.bindingForRoot("root-a")).toBeUndefined(); expect(store.bindingForRoot("root-b")).toBeDefined(); expect((store.db.query("SELECT reason FROM audit WHERE reason='stale-owner-probe-threshold'").get() as any).reason).toBe("stale-owner-probe-threshold")
+	store.bind({ rootSessionId: "root-a", directory: "a2", ownerInstance: "owner-a" }); const rebound = store.staleBindingCandidates(50_000).find((item) => item.rootSessionId === "root-a")!; expect(store.bindingReapState("root-a")).toBeUndefined(); expect(store.recordBindingReapFailure(a, "timeout", 200_000)).toMatchObject({ recorded: false, state: undefined }); expect(store.deactivateDefinitiveNotRoot(a)).toBe(false); expect(store.deactivateDefinitiveNotRoot(rebound)).toBe(true); expect(store.bindingForRoot("root-a")).toBeUndefined(); expect((store.db.query("SELECT reason FROM audit WHERE reason='stale-owner-probe-not-root'").get() as any).reason).toBe("stale-owner-probe-not-root"); store.close()
+})
+
+test("one newly spaced observation cannot satisfy the current-run CAS count", () => {
+	const store = new Store(":memory:"); store.register("owner", "token", "endpoint"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.db.query("UPDATE instances SET heartbeat_ms=0").run()
+	const candidate = store.staleBindingCandidates(50_000)[0]
+	for (const time of [0, 30_000, 60_000, 90_000, 120_000]) expect(store.recordBindingReapFailure(candidate, "timeout", time).recorded).toBe(true)
+	const accepted = store.recordBindingReapFailure(candidate, "timeout", 150_000); expect(accepted.recorded).toBe(true); expect(accepted.state?.consecutiveFailures).toBe(6); expect(store.deactivateStaleBinding(candidate, 1)).toBe(false); expect(store.deactivateStaleBinding(candidate, 2)).toBe(true); store.close()
+})
+
+test("revision identity rejects heartbeat races and tolerates malformed legacy audit timestamps", () => {
+	const store = new Store(":memory:"); store.register("owner", "token", "endpoint"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); const firstRevision = (store.db.query("SELECT binding_revision FROM bindings WHERE root_session_id='root'").get() as any).binding_revision; const firstInstanceRevision = (store.db.query("SELECT instance_revision FROM instances WHERE instance_id='owner'").get() as any).instance_revision
+	store.db.query("UPDATE bindings SET updated_at='legacy-not-a-date' WHERE root_session_id='root'").run(); store.bind({ rootSessionId: "root", directory: "new-d", ownerInstance: "owner" }); expect((store.db.query("SELECT binding_revision,updated_at FROM bindings WHERE root_session_id='root'").get() as any)).toMatchObject({ binding_revision: firstRevision + 1, updated_at: expect.any(String) })
+	store.db.query("UPDATE instances SET heartbeat_ms=0").run(); const candidate = store.staleBindingCandidates(50_000)[0]; store.touch("owner", "token"); expect((store.db.query("SELECT instance_revision FROM instances WHERE instance_id='owner'").get() as any).instance_revision).toBe(firstInstanceRevision + 1); expect(store.recordBindingReapFailure(candidate, "timeout", 1)).toMatchObject({ recorded: false, state: undefined }); store.close()
+})
+
+test("reaper threshold CAS has full cleanup parity and preserves durable payload bytes", () => {
+	const store = new Store(":memory:"); store.register("owner", "token", "endpoint"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.refreshRoute("user", "ctx"); const revision = store.setControl(true).revision
+	store.openCheckpoint({ checkpointId: "reap-checkpoint", requestKey: "reap-checkpoint", root: "root", owner: "owner", alias: 1, question: "q", choices: ["a"], revision }); store.beginInbound({ id: "reap-inbound", fromUserId: "user", contextToken: "ctx", text: "#1\nx", cursorHint: "reap" }); store.beginPending("reap-inbound", "root", 1, revision)
+	store.claimPromptSubmission({ submissionId: "reap-prompt", inboundId: "reap-prompt-in", root: "root", owner: "owner", alias: 1, messageId: "reap-message", body: "prompt body" }); store.beginRuntimeAdmission("reap-prompt", "root", "owner"); store.markPromptCallStarted("reap-prompt")
+	store.openNativeRequest({ requestId: "reap-native", requestKey: "reap-native", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: { exact: "native payload" } }); store.finishNativeAnnouncement("reap-native", true)
+	store.db.query("INSERT INTO outbound VALUES('reap-out','reap-in','SENT',?,?)").run("#1\nbyte exact", "outbound-time"); store.db.query("INSERT INTO control_outbound(outbound_id,dedupe_key,root_session_id,kind,state,payload,conversation_id,context_token,updated_at,logical_text,logical_hash) VALUES('reap-control','reap-control','root','reply','SENT',?,'user','ctx','control-time','body','hash')").run("#1\ncontrol exact")
+	const durableBefore = store.db.query("SELECT message_id,inbound_id,state,payload,updated_at FROM outbound UNION ALL SELECT outbound_id,dedupe_key,state,payload,updated_at FROM control_outbound ORDER BY message_id").all(); const nativePayload = (store.db.query("SELECT payload_json FROM native_requests WHERE request_id='reap-native'").get() as any).payload_json, promptBody = (store.db.query("SELECT body FROM prompt_submissions WHERE submission_id='reap-prompt'").get() as any).body, inboundText = (store.db.query("SELECT text FROM inbound WHERE message_id='reap-inbound'").get() as any).text
+	store.db.query("UPDATE instances SET heartbeat_ms=0").run(); const candidate = store.staleBindingCandidates(50_000)[0]; for (const time of [0, 30_000, 60_000, 90_000, 120_000]) store.recordBindingReapFailure(candidate, "timeout", time); expect(store.deactivateStaleBinding(candidate, 2)).toBe(true)
+	expect(store.checkpointState("reap-checkpoint")).toBe("CANCELLED"); expect(store.pendingState("reap-inbound")).toBe("UNKNOWN"); expect(store.state("reap-inbound")).toBe("UNKNOWN"); expect(store.promptSubmission("reap-prompt")).toMatchObject({ state: "UNKNOWN", admissionFinished: true }); expect(store.nativeRequest("reap-native")?.state).toBe("CANCELLED_REMOTE"); expect(store.runtime("root")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.db.query("SELECT message_id,inbound_id,state,payload,updated_at FROM outbound UNION ALL SELECT outbound_id,dedupe_key,state,payload,updated_at FROM control_outbound ORDER BY message_id").all()).toEqual(durableBefore); expect((store.db.query("SELECT payload_json FROM native_requests WHERE request_id='reap-native'").get() as any).payload_json).toBe(nativePayload); expect((store.db.query("SELECT body FROM prompt_submissions WHERE submission_id='reap-prompt'").get() as any).body).toBe(promptBody); expect((store.db.query("SELECT text FROM inbound WHERE message_id='reap-inbound'").get() as any).text).toBe(inboundText); expect((store.db.query("SELECT reason FROM audit WHERE reason='stale-owner-probe-threshold'").get() as any).reason).toBe("stale-owner-probe-threshold"); store.close()
 })
 
 test("v5 to v6 snapshot preserves history and cancels only active legacy work without replay", () => {
@@ -699,7 +795,7 @@ test("native answer guards are root scoped and cleared by inactive lifecycle tra
 test("native answer guards clear on unregister and control shutdown", () => {
 	const store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" })
 	store.openNativeRequest({ requestId: "guard", requestKey: "guard", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement("guard", true); expect(store.recordNativeAnswerGuard("root", "guard")).toBe(true); expect(store.unregister("owner", "token")).toBe(true); expect(store.consumeNativeAnswerGuard("root", "guard")).toBe(false)
-	store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.openNativeRequest({ requestId: "guard-next", requestKey: "guard-next", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement("guard-next", true); expect(store.recordNativeAnswerGuard("root", "guard-next")).toBe(true); store.setControl(false); expect(store.consumeNativeAnswerGuard("root", "guard-next")).toBe(false); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect(store.db.query("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_native_answer_guard_request'").get()).toBeDefined(); store.close()
+	store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); store.openNativeRequest({ requestId: "guard-next", requestKey: "guard-next", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement("guard-next", true); expect(store.recordNativeAnswerGuard("root", "guard-next")).toBe(true); store.setControl(false); expect(store.consumeNativeAnswerGuard("root", "guard-next")).toBe(false); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(8); expect(store.db.query("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_native_answer_guard_request'").get()).toBeDefined(); store.close()
 })
 
 test("unregister fully deactivates one owned root and all dependent lifecycle state", () => {

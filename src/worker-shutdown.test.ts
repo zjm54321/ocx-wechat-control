@@ -21,6 +21,8 @@ test("shutdown waits for active maintenance before closing store and releasing l
 	const broker = {
 		start: () => "http://127.0.0.1:1",
 		startAdapter: async () => {},
+		startStaleBindingReaper: () => { events.push("reaper.start") },
+		reapStaleBindings: async () => { events.push("reaper.run") },
 		reconcileActiveRuntimes: async () => {
 			reconcileCount++
 			if (reconcileCount === 2) { events.push("reconcile.start"); maintenanceStarted(); await blocked; events.push("reconcile.end") }
@@ -51,7 +53,8 @@ test("shutdown waits for active maintenance before closing store and releasing l
 		expect(events.indexOf("store.close")).toBeLessThan(events.indexOf("lock.release"))
 		expect(events.filter((event) => event === "lock.update")).toHaveLength(2)
 		expect(events.filter((event) => event === "expire")).toHaveLength(1)
-		expect(events.filter((event) => event === "binding.sweep")).toHaveLength(3)
+		expect(events.filter((event) => event === "binding.sweep")).toHaveLength(2)
+		expect(events.indexOf("binding.sweep")).toBeLessThan(events.indexOf("reaper.run")); expect(events.indexOf("reaper.run")).toBeLessThan(events.indexOf("reconcile.start"))
 	} finally {
 		globalThis.setInterval = originalSetInterval
 		globalThis.clearInterval = originalClearInterval

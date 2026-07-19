@@ -4,6 +4,7 @@ import { makeRpcRequest } from "./broker"
 import * as path from "node:path"
 import { existsSync } from "node:fs"
 import { createV2ControlClient, type ControlResult, type V2ControlClient } from "./control-client"
+import { STALE_REAPER_PROOF_DOMAIN, STALE_REAPER_PROOF_VERSION, signStaleReaperResponse, validStaleReaperChallenge, validStaleReaperProof, verifyStaleReaperRequest, type StaleReaperOutcome } from "./stale-reaper-auth"
 
 export interface WorkerOptions { enabled: boolean; weixinCommand: string[] }
 export interface CallbackServer { endpoint: string; token: string; stop(): void }
@@ -170,11 +171,29 @@ export function createCallbackHandler(client: LegacyCallbackClient, sharedSecret
 	if (controlClient && !boundedString(callbackDirectory, MAX_DIRECTORY_LENGTH)) throw new Error("Invalid callback plugin directory")
 	return async (request) => {
 		if (request.method !== "POST") return Response.json({ error: "method" }, { status: 405 })
-		if (request.headers.get("x-wechat-control-key") !== sharedSecret || request.headers.get("x-wechat-instance-token") !== instanceToken) return Response.json({ error: "unauthorized" }, { status: 401 })
+		if (request.headers.get("x-wechat-control-key") !== sharedSecret) return Response.json({ error: "unauthorized" }, { status: 401 })
 		const pathname = new URL(request.url).pathname
 		if (pathname === "/health") {
-			try { const body = object(await request.json()); if (!body) return Response.json({ error: "bad-request" }, { status: 400 }); if (body.rootSessionId) { if (!boundedString(body.rootSessionId)) return Response.json({ error: "bad-request" }, { status: 400 }); if (controlClient) { if (!(await exactRoot(controlClient, body.rootSessionId, callbackDirectory as string))) return Response.json({ error: "not-root" }, { status: 409 }) } else { const response = object(await client.session.get({ path: { id: body.rootSessionId } })), session = sessionIdentity(response?.data); if (!session || session.id !== body.rootSessionId || session.parentID) return Response.json({ error: "not-root" }, { status: 409 }) } }; return Response.json({ ok: true }) } catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
+			const body = await boundedBody(request)
+			if (!body) return Response.json({ error: "bad-request" }, { status: 400 })
+			const probeRequest = body.proofDomain !== undefined || body.proofVersion !== undefined || body.challenge !== undefined || body.requestProof !== undefined
+			if (probeRequest) {
+				const rootSessionId = body.rootSessionId, challenge = body.challenge, requestProof = body.requestProof
+				if (body.proofDomain !== STALE_REAPER_PROOF_DOMAIN || body.proofVersion !== STALE_REAPER_PROOF_VERSION || !boundedString(rootSessionId) || !validStaleReaperChallenge(challenge) || !validStaleReaperProof(requestProof) || !(await verifyStaleReaperRequest(instanceToken, challenge, rootSessionId, requestProof))) return Response.json({ error: "unauthorized" }, { status: 401 })
+				const signed = async (outcome: StaleReaperOutcome): Promise<Response> => {
+					const responseProof = await signStaleReaperResponse(instanceToken, challenge, rootSessionId, outcome), proof = { proofDomain: STALE_REAPER_PROOF_DOMAIN, proofVersion: STALE_REAPER_PROOF_VERSION, challenge, rootSessionId, outcome, responseProof }
+					return outcome === "ok" ? Response.json({ ok: true, ...proof }) : Response.json({ error: "not-root", ...proof }, { status: 409 })
+				}
+				try {
+					if (controlClient) { if (!(await exactRoot(controlClient, rootSessionId, callbackDirectory as string))) return signed("not-root") }
+					else { const response = object(await client.session.get({ path: { id: rootSessionId } })), session = sessionIdentity(response?.data); if (!session || session.id !== rootSessionId || session.parentID) return signed("not-root") }
+					return signed("ok")
+				} catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
+			}
+			if (request.headers.get("x-wechat-instance-token") !== instanceToken) return Response.json({ error: "unauthorized" }, { status: 401 })
+			try { if (body.rootSessionId) { if (!boundedString(body.rootSessionId)) return Response.json({ error: "bad-request" }, { status: 400 }); if (controlClient) { if (!(await exactRoot(controlClient, body.rootSessionId, callbackDirectory as string))) return Response.json({ error: "not-root" }, { status: 409 }) } else { const response = object(await client.session.get({ path: { id: body.rootSessionId } })), session = sessionIdentity(response?.data); if (!session || session.id !== body.rootSessionId || session.parentID) return Response.json({ error: "not-root" }, { status: 409 }) } }; return Response.json({ ok: true }) } catch { return Response.json({ error: "session-unreachable" }, { status: 409 }) }
 		}
+		if (request.headers.get("x-wechat-instance-token") !== instanceToken) return Response.json({ error: "unauthorized" }, { status: 401 })
 		if (pathname === "/inject") return Response.json({ error: "legacy-inject-removed" }, { status: 410 })
 		return controlClient ? handleV2Callback(pathname, request, controlClient, callbackDirectory as string) : Response.json({ error: "v2-client-unavailable" }, { status: 503 })
 	}

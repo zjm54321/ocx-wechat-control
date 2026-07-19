@@ -24,7 +24,7 @@ try { await bootstrapPlugin() } catch (error) { await rm(root, { recursive: true
 let enabled = false, registrations = 0
 const brokerMethods: string[] = []
 const adapter = ["node", path.join(repo, "node_modules", "weixin-mcp", "dist", "cli.js")], workerEntrypoint = path.join(repo, "dist", "worker.js")
-const metadata = { packageVersion: "0.2.3", protocolVersion: 1, capabilities: ["v2-callbacks", "async-prompt-admission", "native-question-permission", "legacy-inject-disabled"], workerPid: process.pid, workerEntrypoint, adapterCommand: adapter, adapterProvenance: { kind: "fixed-local-dependency", package: "weixin-mcp", version: "1.7.7", entrypoint: adapter[1] }, schemaVersion: 6 }
+const metadata = { packageVersion: "0.2.4", protocolVersion: 1, capabilities: ["v2-callbacks", "async-prompt-admission", "native-question-permission", "legacy-inject-disabled", "dynamic-active-aliases", "logical-wechat-reply-identity"], workerPid: process.pid, workerEntrypoint, adapterCommand: adapter, adapterProvenance: { kind: "fixed-local-dependency", package: "weixin-mcp", version: "1.7.7", entrypoint: adapter[1] }, schemaVersion: 7 }
 const broker = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
 	const body = await request.json() as any
 	brokerMethods.push(String(body.method))

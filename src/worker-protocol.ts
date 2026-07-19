@@ -1,7 +1,7 @@
-export const WORKER_PACKAGE_VERSION = "0.2.3"
+export const WORKER_PACKAGE_VERSION = "0.2.4"
 export const WORKER_PROTOCOL_VERSION = 1
-export const WORKER_SCHEMA_VERSION = 6
-export const WORKER_CAPABILITIES = ["v2-callbacks", "async-prompt-admission", "native-question-permission", "legacy-inject-disabled"] as const
+export const WORKER_SCHEMA_VERSION = 7
+export const WORKER_CAPABILITIES = ["v2-callbacks", "async-prompt-admission", "native-question-permission", "legacy-inject-disabled", "dynamic-active-aliases", "logical-wechat-reply-identity"] as const
 
 export interface AdapterProvenance { kind: "fixed-local-dependency"; package: "weixin-mcp"; version: "1.7.7"; entrypoint: string }
 export interface WorkerMetadata {

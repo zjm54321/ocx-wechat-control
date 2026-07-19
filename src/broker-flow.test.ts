@@ -2,6 +2,9 @@ import { expect, test } from "bun:test"
 import { MockWeChatAdapter } from "./adapter"
 import { BrokerService, parseQuestionAnswers, type NativeQuestionPayload } from "./broker"
 import { Store } from "./core"
+import { rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import * as path from "node:path"
 
 type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
 
@@ -27,6 +30,8 @@ async function openNative(broker: BrokerService, input: { requestId: string; req
 }
 
 const questionPayload = (sourceSessionId = "root"): NativeQuestionPayload => ({ sourceSessionId, questions: [{ question: "Choose", options: [{ label: "A" }, { label: "B" }], multiple: false, custom: true }] })
+function tempDatabase(name: string): string { return path.join(tmpdir(), `${name}-${crypto.randomUUID()}.sqlite`) }
+function removeDatabase(filename: string): void { for (const suffix of ["", "-wal", "-shm"]) try { rmSync(`${filename}${suffix}`, { force: true }) } catch {} }
 
 test("same-root admissions serialize only callback admission and never send assistant text", async () => {
 	const releases: Array<(response: Response) => void> = [], calls: Array<Record<string, unknown>> = []
@@ -47,7 +52,7 @@ test("different roots admit in parallel and duplicate inbound never resubmits", 
 test("prompt rejection and uncertainty map to durable terminal states without replay", async () => {
 	let mode: "reject" | "throw" = "reject", calls = 0
 	const { store, broker } = flow(async () => { calls++; if (mode === "throw") throw new DOMException("timeout", "TimeoutError"); return Response.json({ ok: false, certainty: "REJECTED", error: "not-root" }, { status: 409 }) })
-	expect((await broker.handleInbound(inbound("rejected", 1, "x"))).reason).toBe("prompt-rejected"); expect(store.promptSubmission("rejected")?.state).toBe("REJECTED"); expect(store.bindingForRoot("root")?.active).toBe(false)
+	expect((await broker.handleInbound(inbound("rejected", 1, "x"))).reason).toBe("prompt-rejected"); expect(store.promptSubmission("rejected")?.state).toBe("REJECTED"); expect(store.bindingForRoot("root")).toBeUndefined()
 	store.bind({ rootSessionId: "root", directory: "d-root", ownerInstance: "owner" }); mode = "throw"; expect((await broker.handleInbound(inbound("unknown", 1, "y"))).reason).toBe("unknown-no-replay"); expect(store.promptSubmission("unknown")?.state).toBe("UNKNOWN"); await broker.handleInbound(inbound("unknown", 1, "y")); expect(calls).toBe(2); store.close()
 })
 
@@ -68,7 +73,7 @@ test("maintenance isolates batch not-root and renews the remaining root", async 
 	store.bind({ rootSessionId: "a", directory: "shared", ownerInstance: "owner" }); store.bind({ rootSessionId: "b", directory: "shared", ownerInstance: "owner" })
 	for (const [root, alias] of [["a", 1], ["b", 2]] as const) { const id = `${root}-prompt`; store.claimPromptSubmission({ submissionId: id, inboundId: `${id}-in`, root, owner: "owner", alias, body: root }); const generation = store.beginRuntimeAdmission(id, root, "owner", 100, 10)!; store.finishRuntimeAdmission(id, root, "owner"); store.observeRuntimeStatus(root, "owner", "BUSY", generation, 100, 10) }
 	await broker.reconcileActiveRuntimes(105, 20)
-	expect(calls).toEqual([["a", "b"], ["a"], ["b"]]); expect(store.bindingForRoot("a")?.active).toBe(false); expect(store.runtime("a")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.bindingForRoot("b")?.active).toBe(true); expect(store.runtime("b")).toMatchObject({ status: "BUSY", leaseExpiresMs: 125 }); store.close()
+	expect(calls).toEqual([["a", "b"], ["a"], ["b"]]); expect(store.bindingForRoot("a")).toBeUndefined(); expect(store.runtime("a")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.bindingForRoot("b")?.active).toBe(true); expect(store.runtime("b")).toMatchObject({ status: "BUSY", leaseExpiresMs: 125 }); store.close()
 })
 
 test("maintenance isolates malformed batch and per-root network failure", async () => {
@@ -100,11 +105,63 @@ test("zero one and multiple native precedence never accidentally prompts", async
 	const explicit = store.nativeRequest("q-two")!; expect((await broker.handleInbound(inbound("explicit", 1, `${explicit.code} B`))).ok).toBe(true); expect(store.nativeRequest("q-two")?.state).toBe("RESOLVED"); expect(one.code).toMatch(/^Q[A-Z2-7]{6}$/); store.close()
 })
 
-test("wrong expired and cross-alias codes are rejected before callback", async () => {
-	let callbacks = 0; const { store, broker } = flow(async () => { callbacks++; return Response.json({ ok: true, resolved: true }) }, ["a", "b"])
+test("wrong expired and cross-root codes are rejected before callback", async () => {
+	let callbacks = 0; const { store, adapter, broker } = flow(async () => { callbacks++; return Response.json({ ok: true, resolved: true }) }, ["a", "b"])
 	expect((await broker.handleInbound(inbound("wrong", 1, "QAAAAAA A"))).reason).toBe("native-code-invalid")
-	await openNative(broker, { requestId: "cross", rootSessionId: "b", kind: "QUESTION", payload: questionPayload("b") }); const cross = store.nativeRequest("cross")!; expect((await broker.handleInbound(inbound("cross-in", 1, `${cross.code} A`))).reason).toBe("native-code-invalid")
+	await openNative(broker, { requestId: "cross", rootSessionId: "b", kind: "QUESTION", payload: questionPayload("b") }); const cross = store.nativeRequest("cross")!; const crossResult = await broker.handleInbound(inbound("cross-in", 1, `${cross.code} A`)); expect(crossResult.reason).toBe("native-code-cross-root"); expect((adapter.sent.at(-1)?.text ?? "")).toContain("另一个当前会话")
 	store.settleNativeTerminal("cross", "RESOLVED"); expect((await broker.handleInbound(inbound("expired", 2, `${cross.code} A`))).reason).toBe("native-code-invalid"); expect(callbacks).toBe(0); store.close()
+})
+
+test("id and newly generated prompts use the current compact alias", async () => {
+	const { store, adapter, broker } = flow(async () => Response.json({ ok: true }), ["a", "b"])
+	store.deactivateBinding("a", "owner")
+	await broker.handleInbound({ id: "list", fromUserId: "controller", contextToken: "ctx", text: "id", cursorHint: "list" })
+	expect(adapter.sent.at(-1)?.text).toBe("#1  未命名会话")
+	const response = await broker.handleRequest(rpc("request-input", { rootSessionId: "b", requestKey: "compact-prompt", question: "Choose", choices: ["A"] }))
+	expect(response.status).toBe(200); expect(adapter.sent.at(-1)?.text).toContain("#1\n"); expect(adapter.sent.at(-1)?.text).toContain("请回复 #1")
+	store.close()
+})
+
+test("explicit native request remains answerable after its displayed alias moves", async () => {
+	const callbacks: string[] = [], { store, adapter, broker } = flow(async (url) => { callbacks.push(new URL(String(url)).pathname); return Response.json({ ok: true, resolved: true }) }, ["a", "b"])
+	await openNative(broker, { requestId: "moving-q", rootSessionId: "b", kind: "QUESTION", payload: questionPayload("b") })
+	const native = store.nativeRequest("moving-q")!; expect(adapter.sent[0]?.text).toContain("#2\n"); store.deactivateBinding("a", "owner")
+	const result = await broker.handleInbound(inbound("moving-answer", 1, `${native.code} 1`)); expect(result.ok).toBe(true); expect(store.nativeRequest("moving-q")?.state).toBe("RESOLVED"); expect(callbacks).toContain("/resolve-question"); store.close()
+})
+
+test("multiple native questions render readable blank-line blocks", async () => {
+	const { store, adapter, broker } = flow(async () => Response.json({ ok: true }), ["root"])
+	const payload: NativeQuestionPayload = { sourceSessionId: "root", questions: [{ question: "First", options: [{ label: "A" }], multiple: false, custom: false }, { question: "Second", options: [{ label: "B" }], multiple: false, custom: false }] }
+	await openNative(broker, { requestId: "formatted-multi", kind: "QUESTION", payload }); const code = store.nativeRequest("formatted-multi")!.code
+	expect(adapter.sent.at(-1)?.text).toBe(`#1\n${code} 问题请求\n1: First\n1. A\n\n2: Second\n1. B\n请一次性回复 #1\n${code} 后按“N: 答案”逐行填写。`)
+	store.close()
+})
+
+test("native answers require atomic explicit forms and keep invalid requests OPEN", async () => {
+	const { store, adapter, broker } = flow(async (url) => String(url).endsWith("/resolve-question") ? Response.json({ ok: true, resolved: true }) : Response.json({ ok: true }))
+	await openNative(broker, { requestId: "atomic-q", kind: "QUESTION", payload: questionPayload() }); const native = store.nativeRequest("atomic-q")!
+	expect((await broker.handleInbound(inbound("code-only", 1, native.code))).reason).toBe("native-answer-invalid"); expect(store.nativeRequest("atomic-q")?.state).toBe("OPEN"); expect(adapter.sent.at(-1)?.text).toContain(`#1\n${native.code} 1`)
+	expect((await broker.handleInbound(inbound("split-answer", 1, "1"))).reason).toBe("native-answer-invalid"); expect(store.nativeRequest("atomic-q")?.state).toBe("OPEN")
+	expect((await broker.handleInbound(inbound("explicit-answer", 1, `${native.code} 1`))).ok).toBe(true); expect(store.nativeRequest("atomic-q")?.state).toBe("RESOLVED"); store.close()
+})
+
+test("fresh sole native question accepts exact implicit #1 newline 1", async () => {
+	const callbacks: Array<Record<string, unknown>> = [], { store, broker } = flow(async (url, init) => { if (String(url).endsWith("/resolve-question")) callbacks.push(JSON.parse(String(init?.body))); return Response.json({ ok: true, resolved: true }) })
+	await openNative(broker, { requestId: "implicit-q", kind: "QUESTION", payload: questionPayload() })
+	expect((await broker.handleInbound(inbound("implicit-answer", 1, "1"))).ok).toBe(true)
+	expect(callbacks).toEqual([expect.objectContaining({ rootSessionId: "root", requestId: "implicit-q", answers: [["A"]] })]); expect(store.nativeRequest("implicit-q")?.state).toBe("RESOLVED"); store.close()
+})
+
+test("code-only split-answer guard survives Store and broker restart", async () => {
+	const filename = tempDatabase("native-answer-guard-restart"), firstAdapter = new MockWeChatAdapter()
+	let store = new Store(filename); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d-root", ownerInstance: "owner" }); store.refreshRoute("controller", "ctx")
+	let broker = new BrokerService(store, firstAdapter, "secret", "worker", async () => Response.json({ ok: true, resolved: true }))
+	await openNative(broker, { requestId: "restart-q", kind: "QUESTION", payload: questionPayload() }); const code = store.nativeRequest("restart-q")!.code
+	expect((await broker.handleInbound(inbound("restart-code-only", 1, code))).reason).toBe("native-answer-invalid"); expect(store.nativeRequest("restart-q")?.state).toBe("OPEN"); store.close()
+	store = new Store(filename); const callbacks: Array<Record<string, unknown>> = [], secondAdapter = new MockWeChatAdapter(); broker = new BrokerService(store, secondAdapter, "secret", "worker", async (url, init) => { if (String(url).endsWith("/resolve-question")) callbacks.push(JSON.parse(String(init?.body))); return Response.json({ ok: true, resolved: true }) })
+	expect((await broker.handleInbound(inbound("restart-split", 1, "1"))).reason).toBe("native-answer-invalid"); expect(store.nativeRequest("restart-q")?.state).toBe("OPEN"); expect(callbacks).toHaveLength(0)
+	expect((await broker.handleInbound(inbound("restart-atomic", 1, `${code} 1`))).ok).toBe(true); expect(callbacks).toEqual([expect.objectContaining({ requestId: "restart-q", answers: [["A"]] })]); expect(store.nativeRequest("restart-q")?.state).toBe("RESOLVED")
+	store.close(); removeDatabase(filename)
 })
 
 test("question grammar maps ordered single multiple custom and multi-question answers", () => {
@@ -164,6 +221,13 @@ test("wechat reply uses durable call-ID dedupe and UNKNOWN never retries", async
 	const first = await send(); expect(first.status).toBe(200); expect(await first.json()).toMatchObject({ ok: true, state: "SENT" }); expect(adapter.sent.at(-1)?.text).toBe("#1\nhello"); const duplicate = await send(); expect(await duplicate.json()).toMatchObject({ replayed: true, state: "SENT" }); expect(adapter.sent).toHaveLength(1)
 	const conflict = await broker.handleRequest(rpc("wechat-reply", { rootSessionId: "root", callId: "call-1", text: "different" })); expect(conflict.status).toBe(409); expect(await conflict.json()).toEqual({ error: "reply-call-conflict" }); expect(adapter.sent).toHaveLength(1)
 	adapter.failSend = true; const unknown = await broker.handleRequest(rpc("wechat-reply", { rootSessionId: "root", callId: "call-2", text: "uncertain" })); expect(unknown.status).toBe(409); expect(await unknown.json()).toMatchObject({ state: "UNKNOWN" }); adapter.failSend = false; const retry = await broker.handleRequest(rpc("wechat-reply", { rootSessionId: "root", callId: "call-2", text: "uncertain" })); expect(await retry.json()).toMatchObject({ replayed: true, state: "UNKNOWN" }); expect(adapter.sent).toHaveLength(1); expect(store.controlOutboundState("wechat-reply:root:call-2")).toBe("UNKNOWN"); store.close()
+})
+
+test("wechat reply replay uses logical text after alias movement and preserves historical rendering", async () => {
+	const { store, adapter, broker } = flow(async () => Response.json({}), ["a", "b"])
+	const first = await broker.handleRequest(rpc("wechat-reply", { rootSessionId: "b", callId: "move-call", text: "hello" })); expect(first.status).toBe(200); expect(adapter.sent.at(-1)?.text).toBe("#2\nhello"); store.deactivateBinding("a", "owner")
+	const replay = await broker.handleRequest(rpc("wechat-reply", { rootSessionId: "b", callId: "move-call", text: "hello" })); expect(await replay.json()).toMatchObject({ replayed: true, state: "SENT" }); expect(adapter.sent).toHaveLength(1); expect(store.controlOutboundPayload("wechat-reply:b:move-call")).toBe("#2\nhello")
+	const conflict = await broker.handleRequest(rpc("wechat-reply", { rootSessionId: "b", callId: "move-call", text: "changed" })); expect(conflict.status).toBe(409); expect(await conflict.json()).toEqual({ error: "reply-call-conflict" }); store.close()
 })
 
 type JsonObject = Record<string, unknown>

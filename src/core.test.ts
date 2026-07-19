@@ -42,16 +42,103 @@ test("binding activity defaults on old v6 data and aliases are never reused", ()
 	legacy.exec("PRAGMA user_version=6; CREATE TABLE bindings(alias INTEGER PRIMARY KEY AUTOINCREMENT,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); INSERT INTO bindings VALUES(4,'historical','d','owner','Old','now','now');")
 	legacy.close()
 	const store = new Store(filename)
-	expect(store.bindingForRoot("historical")).toMatchObject({ alias: 4, active: true })
+	expect(store.bindingForRoot("historical")).toMatchObject({ alias: 1, registrationAlias: 4, active: true })
 	expect(store.deactivateBinding("historical", "owner")).toBe(true); expect(store.bindings()).toEqual([])
-	expect(store.bind({ rootSessionId: "new-root", directory: "d", ownerInstance: "owner" }).alias).toBe(5)
-	expect(store.bind({ rootSessionId: "historical", directory: "new-d", ownerInstance: "owner", title: "Refreshed" })).toMatchObject({ alias: 4, active: true, title: "Refreshed" })
+	expect(store.bindingForRoot("historical")).toBeUndefined()
+	expect(store.bind({ rootSessionId: "new-root", directory: "d", ownerInstance: "owner" })).toMatchObject({ alias: 1, registrationAlias: 5 })
+	expect(store.bind({ rootSessionId: "historical", directory: "new-d", ownerInstance: "owner", title: "Refreshed" })).toMatchObject({ alias: 1, registrationAlias: 4, active: true, title: "Refreshed" })
 	store.close(); cleanup(filename)
+})
+
+test("active aliases are dense over immutable registration order", () => {
+	const store = new Store(":memory:"), now = new Date().toISOString()
+	for (const [alias, root] of [[4, "four"], [10, "ten"], [25, "twenty-five"]] as const) store.db.query("INSERT INTO bindings(alias,root_session_id,directory,owner_instance,title,active,created_at,updated_at) VALUES(?,?,?,'owner',NULL,1,?,?)").run(alias, root, root, now, now)
+	expect(store.bindings().map(({ alias, registrationAlias, rootSessionId }) => [alias, registrationAlias, rootSessionId])).toEqual([[1, 4, "four"], [2, 10, "ten"], [3, 25, "twenty-five"]])
+	expect(store.bindingForAlias(2)).toMatchObject({ rootSessionId: "ten", alias: 2, registrationAlias: 10 })
+	expect(store.bindingForRoot("twenty-five")).toMatchObject({ alias: 3, registrationAlias: 25 })
+	expect(store.deactivateBinding("ten", "owner")).toBe(true)
+	expect(store.bindings().map((binding) => [binding.rootSessionId, binding.alias])).toEqual([["four", 1], ["twenty-five", 2]])
+	expect(store.bindingForRoot("ten")).toBeUndefined()
+	expect(store.bind({ rootSessionId: "ten", directory: "ten-new", ownerInstance: "owner" })).toMatchObject({ alias: 2, registrationAlias: 10 })
+	expect(store.bindings().map((binding) => [binding.rootSessionId, binding.alias])).toEqual([["four", 1], ["ten", 2], ["twenty-five", 3]])
+	expect((store.db.query("SELECT group_concat(alias,',') AS aliases FROM bindings ORDER BY alias").get() as any).aliases).toBe("4,10,25")
+	expect((store.db.query("SELECT seq FROM sqlite_sequence WHERE name='bindings'").get() as any).seq).toBe(25)
+	store.close()
+})
+
+test("v6 to v7 preserves durable outbound history and conservatively backfills logical replies", () => {
+	const filename = tempFile("logical-reply-v6"), legacy = new Database(filename), expires = Date.now() + 60_000
+	legacy.exec("PRAGMA user_version=6; CREATE TABLE bindings(alias INTEGER PRIMARY KEY AUTOINCREMENT,root_session_id TEXT NOT NULL UNIQUE,directory TEXT NOT NULL,owner_instance TEXT NOT NULL,title TEXT,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE control_outbound(outbound_id TEXT PRIMARY KEY,dedupe_key TEXT NOT NULL UNIQUE,root_session_id TEXT NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE outbound_echoes(echo_hash TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,context_token TEXT NOT NULL DEFAULT '',payload TEXT NOT NULL,expires_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);")
+	legacy.query("INSERT INTO bindings VALUES(10,'root','d','owner','Root',1,'now','now')").run()
+	legacy.query("INSERT INTO control_outbound VALUES('generated','wechat-reply:root:one','root','wechat-reply','SENT','#10\nbody','user','ctx','now'),('noncanonical','wechat-reply:root:two','root','wechat-reply','UNKNOWN','#010\nbody','user','ctx','now'),('bad-key','wechat-reply:root:','root','wechat-reply','SENT','#10\nbody','user','ctx','now'),('wrong-root','wechat-reply:other:three','root','wechat-reply','SENT','#10\nbody','user','ctx','now'),('other','other','root','permission','SENT','#10\nbody','user','ctx','now')").run()
+	legacy.query("INSERT INTO outbound_echoes VALUES('echo','user','ctx','#10\nbody',?,'now')").run(expires); legacy.close()
+	const store = new Store(filename), backup = store.migrationBackupPath
+	expect(backup).toContain("pre-v7"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7)
+	expect(store.bindingForRoot("root")).toMatchObject({ alias: 1, registrationAlias: 10 })
+	expect(store.db.query("SELECT outbound_id AS id,state,payload,logical_text AS text,logical_hash AS hash FROM control_outbound ORDER BY outbound_id").all()).toEqual([
+		{ id: "bad-key", state: "SENT", payload: "#10\nbody", text: null, hash: null },
+		{ id: "generated", state: "SENT", payload: "#10\nbody", text: "body", hash: Bun.CryptoHasher.hash("sha256", "body", "hex") },
+		{ id: "noncanonical", state: "UNKNOWN", payload: "#010\nbody", text: null, hash: null },
+		{ id: "other", state: "SENT", payload: "#10\nbody", text: null, hash: null },
+		{ id: "wrong-root", state: "SENT", payload: "#10\nbody", text: null, hash: null },
+	])
+	expect((store.db.query("SELECT payload FROM outbound_echoes WHERE echo_hash='echo'").get() as any).payload).toBe("#10\nbody")
+	expect((store.db.query("SELECT seq FROM sqlite_sequence WHERE name='bindings'").get() as any).seq).toBe(10)
+	store.close(); cleanup(filename, backup)
+})
+
+test("logical wechat reply identity replays across alias movement without rewriting history", () => {
+	const store = new Store(":memory:"), now = new Date().toISOString()
+	for (const [alias, root] of [[4, "earlier"], [10, "target"]] as const) store.db.query("INSERT INTO bindings(alias,root_session_id,directory,owner_instance,title,active,created_at,updated_at) VALUES(?,?,?,'owner',NULL,1,?,?)").run(alias, root, root, now, now)
+	store.refreshRoute("user", "ctx"); store.setControl(true)
+	const first = store.claimControlOutbound({ dedupeKey: "wechat-reply:target:call", root: "target", kind: "wechat-reply", payload: "#2\nsame", logicalText: "same" })
+	expect(first?.result).toBe("CLAIMED"); store.finishControlOutbound((first as any).outboundId, true); store.recordEcho("user", "ctx", "#2\nsame")
+	store.deactivateBinding("earlier", "owner"); expect(store.bindingForRoot("target")?.alias).toBe(1)
+	expect(store.claimControlOutbound({ dedupeKey: "wechat-reply:target:call", root: "target", kind: "wechat-reply", payload: "#1\nsame", logicalText: "same" })).toEqual({ result: "REPLAY", state: "SENT", payload: "#2\nsame" })
+	expect(store.claimControlOutbound({ dedupeKey: "wechat-reply:target:call", root: "target", kind: "wechat-reply", payload: "#1\nchanged", logicalText: "changed" })).toEqual({ result: "CONFLICT" })
+	expect(store.controlOutboundPayload("wechat-reply:target:call")).toBe("#2\nsame"); expect(store.matchesEcho("user", "ctx", "#2\nsame")).toBe(true)
+	store.close()
+})
+
+test("UNKNOWN logical wechat reply replays after alias compaction without changing history or echo", () => {
+	const store = new Store(":memory:"), now = new Date().toISOString()
+	for (const [alias, root] of [[4, "earlier"], [10, "target"]] as const) store.db.query("INSERT INTO bindings(alias,root_session_id,directory,owner_instance,title,active,created_at,updated_at) VALUES(?,?,?,'owner',NULL,1,?,?)").run(alias, root, root, now, now)
+	store.refreshRoute("user", "ctx"); store.setControl(true)
+	const first = store.claimControlOutbound({ dedupeKey: "wechat-reply:target:unknown", root: "target", kind: "wechat-reply", payload: "#2\nuncertain", logicalText: "uncertain" }) as any
+	store.finishControlOutbound(first.outboundId, false); store.recordEcho("user", "ctx", "#2\nuncertain")
+	store.deactivateBinding("earlier", "owner")
+	const replay = store.claimControlOutbound({ dedupeKey: "wechat-reply:target:unknown", root: "target", kind: "wechat-reply", payload: "#1\nuncertain", logicalText: "uncertain" })
+	expect(replay).toEqual({ result: "REPLAY", state: "UNKNOWN", payload: "#2\nuncertain" })
+	expect(store.controlOutboundState("wechat-reply:target:unknown")).toBe("UNKNOWN")
+	expect(store.controlOutboundPayload("wechat-reply:target:unknown")).toBe("#2\nuncertain")
+	expect(store.matchesEcho("user", "ctx", "#2\nuncertain")).toBe(true)
+	store.close()
+})
+
+test("checkpoint request keys are scoped by root", () => {
+	const store = new Store(":memory:")
+	store.bind({ rootSessionId: "root-a", directory: "a", ownerInstance: "owner" }); store.bind({ rootSessionId: "root-b", directory: "b", ownerInstance: "owner" }); store.refreshRoute("user", "ctx"); const revision = store.setControl(true).revision
+	expect(store.openCheckpoint({ checkpointId: "checkpoint-a", requestKey: "same-request", root: "root-a", owner: "owner", alias: 1, question: "a", choices: [], revision })).toBe(true)
+	expect(store.openCheckpoint({ checkpointId: "checkpoint-b", requestKey: "same-request", root: "root-b", owner: "owner", alias: 2, question: "b", choices: [], revision })).toBe(true)
+	expect(store.checkpointForRequest("same-request", "root-a")?.checkpointId).toBe("checkpoint-a")
+	expect(store.checkpointForRequest("same-request", "root-b")?.checkpointId).toBe("checkpoint-b")
+	expect(store.checkpointForRequest("same-request", "missing")).toBeUndefined()
+	expect((store.db.query("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_checkpoint_root_request_key'").get() as any).name).toBe("idx_checkpoint_root_request_key")
+	store.close()
 })
 
 test("registration list is ordered, hides roots and remains within adapter limit", () => {
 	const bindings = Array.from({ length: 80 }, (_, index) => ({ alias: 80 - index, rootSessionId: `secret-${index}`, directory: "d", ownerInstance: "o", title: "会".repeat(120), active: true }))
 	const text = formatRegistrationList(bindings); expect(text.length).toBeLessThanOrEqual(4000); expect(text).toContain("#1  "); expect(text).toContain("另有"); expect(text).not.toContain("secret-")
+})
+
+test("registration list uses exact blank-line spacing and readable truncation", () => {
+	const base = (alias: number, title: string) => ({ alias, rootSessionId: `root-${alias}`, directory: "d", ownerInstance: "o", title, active: true })
+	expect(formatRegistrationList([base(2, "two"), base(1, "one")])).toBe("#1  one\n\n#2  two")
+	expect(formatRegistrationList([base(1, "one")])).toBe("#1  one")
+	const long = "x".repeat(1900), truncated = formatRegistrationList([base(1, long), base(2, long), base(3, long)])
+	expect(truncated).toBe(`#1  ${long}\n\n#2  ${long}\n\n……另有 1 个会话未显示。`)
+	expect(truncated.length).toBeLessThanOrEqual(4000); expect(truncated).toContain("\n\n……另有 1 个会话未显示。")
 })
 
 test("wechat id lists registrations on and off without callback and refreshes global route", async () => {
@@ -234,11 +321,11 @@ function createWalV2(filename: string): Database {
 
 test("WAL-consistent legacy-to-v5 snapshot preserves registrations and sequence", () => {
 	const filename = tempFile("wal-v2"), writer = createWalV2(filename), store = new Store(filename); const backup = store.migrationBackupPath
-	expect(backup).toBeDefined(); expect(backup).toContain("pre-v5"); expect(store.bindingForAlias(7)?.rootSessionId).toBe("root-wal"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6); expect(store.control()).toEqual({ enabled: false, revision: 0 }); expect(store.route()).toMatchObject({ conversationId: "conversation-wal", contextToken: null })
+	expect(backup).toBeDefined(); expect(backup).toContain("pre-v5"); expect(store.bindingForRoot("root-wal")).toMatchObject({ alias: 1, registrationAlias: 7 }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect(store.control()).toEqual({ enabled: false, revision: 0 }); expect(store.route()).toMatchObject({ conversationId: "conversation-wal", contextToken: null })
 	expect((store.db.query("PRAGMA table_info(session_activity)").all() as any[]).map((row) => row.name)).toContain("epoch"); expect((store.db.query("PRAGMA table_info(checkpoints)").all() as any[]).map((row) => row.name)).toContain("request_key"); expect((store.db.query("PRAGMA table_info(outbound_echoes)").all() as any[]).map((row) => row.name)).toContain("expires_ms")
 	const snapshot = new Database(backup!); expect((snapshot.query("SELECT value FROM meta WHERE key='custom'").get() as any).value).toBe("wal-data"); expect((snapshot.query("SELECT conversation_id AS value FROM bindings WHERE alias=7").get() as any).value).toBe("conversation-wal"); expect(snapshot.query("SELECT 1 FROM pending_replies WHERE inbound_id='pending-wal'").get()).toBeDefined(); snapshot.close()
-	expect(store.bind({ rootSessionId: "root-two", directory: "d", ownerInstance: "owner" }).alias).toBe(8)
-	store.close(); writer.close(); const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect(reopened.bindingForAlias(7)?.title).toBeNull(); reopened.close(); cleanup(filename, backup)
+	expect(store.bind({ rootSessionId: "root-two", directory: "d", ownerInstance: "owner" })).toMatchObject({ alias: 2, registrationAlias: 8 })
+	store.close(); writer.close(); const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect(reopened.bindingForRoot("root-wal")?.title).toBeNull(); reopened.close(); cleanup(filename, backup)
 })
 
 function createWalV3(filename: string): Database {
@@ -255,21 +342,21 @@ function createWalV4(filename: string): Database {
 
 test("v4-to-v5 migration snapshots once and preserves alias sequence", () => {
 	const filename = tempFile("wal-v4"), writer = createWalV4(filename), store = new Store(filename), backup = store.migrationBackupPath
-	expect(backup).toContain("pre-v5"); expect(store.bindingForAlias(12)).toMatchObject({ rootSessionId: "root-v4", directory: "dir-v4", ownerInstance: "owner-v4", title: null }); expect(store.route()).toMatchObject({ conversationId: "recipient-v4", contextToken: null }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6)
-	expect(store.bind({ rootSessionId: "next-v5", directory: "d", ownerInstance: "o" }).alias).toBe(13); store.close(); writer.close()
-	const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect((reopened.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("6"); reopened.close(); cleanup(filename, backup)
+	expect(backup).toContain("pre-v5"); expect(store.bindingForRoot("root-v4")).toMatchObject({ alias: 1, registrationAlias: 12, directory: "dir-v4", ownerInstance: "owner-v4", title: null }); expect(store.route()).toMatchObject({ conversationId: "recipient-v4", contextToken: null }); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7)
+	expect(store.bind({ rootSessionId: "next-v5", directory: "d", ownerInstance: "o" })).toMatchObject({ alias: 2, registrationAlias: 13 }); store.close(); writer.close()
+	const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect((reopened.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("7"); reopened.close(); cleanup(filename, backup)
 })
 
 test("v4 multiple conversations migrate fail-closed and alias holes advance from max", () => {
 	const filename = tempFile("wal-v4-multiple"), writer = createWalV4(filename)
 	writer.exec("DELETE FROM bindings; INSERT INTO bindings VALUES(2,'root-a','a','owner-a','recipient-a','ctx-a','created'); INSERT INTO bindings VALUES(9,'root-b','b','owner-b','recipient-b','ctx-b','created'); CREATE TABLE control_state(singleton INTEGER PRIMARY KEY,enabled INTEGER NOT NULL,revision INTEGER NOT NULL); INSERT INTO control_state VALUES(1,1,7); CREATE TABLE checkpoints(checkpoint_id TEXT PRIMARY KEY,request_key TEXT,root_session_id TEXT NOT NULL,owner_instance TEXT NOT NULL,conversation_id TEXT NOT NULL,alias INTEGER NOT NULL,question TEXT NOT NULL,choices_json TEXT NOT NULL,state TEXT NOT NULL,inbound_id TEXT,control_revision INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); INSERT INTO checkpoints VALUES('multi-cp','key','root-a','owner-a','recipient-a',2,'q','[]','UNKNOWN',NULL,7,'created','created'); CREATE TABLE session_activity(root_session_id TEXT PRIMARY KEY,owner_instance TEXT NOT NULL,running INTEGER NOT NULL DEFAULT 0,idle INTEGER NOT NULL DEFAULT 1,last_assistant_id TEXT,last_assistant_error INTEGER NOT NULL DEFAULT 0,direct_assistant_id TEXT,epoch INTEGER NOT NULL DEFAULT 0,run_id INTEGER NOT NULL DEFAULT 0,origin TEXT NOT NULL DEFAULT 'NONE',candidate_run INTEGER,claimed_run INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL); INSERT INTO session_activity VALUES('root-a','owner-a',1,0,NULL,0,NULL,7,1,'LOCAL',1,0,'created'); CREATE TABLE inbound(message_id TEXT PRIMARY KEY,from_user_id TEXT NOT NULL,context_token TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,root_session_id TEXT,prompt_message_id TEXT,reason TEXT,updated_at TEXT NOT NULL); INSERT INTO inbound VALUES('multi-wait','recipient-a','ctx-a','#2 x','INJECTING','root-a',NULL,NULL,'created'); CREATE TABLE pending_replies(inbound_id TEXT PRIMARY KEY,root_session_id TEXT NOT NULL,prompt_message_id TEXT,alias INTEGER NOT NULL,state TEXT NOT NULL,assistant_message_id TEXT,payload TEXT,injected_at INTEGER,control_revision INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL); INSERT INTO pending_replies VALUES('multi-wait','root-a',NULL,2,'WAITING',NULL,NULL,NULL,7,'created');")
-	const store = new Store(filename), backup = store.migrationBackupPath; expect(store.route()).toMatchObject({ conversationId: null, contextToken: null }); expect(store.control().enabled).toBe(false); expect(store.checkpointState("multi-cp")).toBe("CANCELLED"); expect(store.pendingState("multi-wait")).toBe("UNKNOWN"); expect(store.state("multi-wait")).toBe("UNKNOWN"); expect((store.db.query("SELECT reason FROM inbound WHERE message_id='multi-wait'").get() as any).reason).toBe("migration-multiple-global-routes"); expect((store.db.query("SELECT running,origin FROM session_activity WHERE root_session_id='root-a'").get() as any)).toMatchObject({ running: 0, origin: "NONE" }); expect((store.db.query("SELECT reason FROM audit WHERE reason='migration-multiple-global-routes'").get() as any).reason).toBe("migration-multiple-global-routes"); expect(store.bind({ rootSessionId: "root-c", directory: "c", ownerInstance: "owner-c" }).alias).toBe(10)
+	const store = new Store(filename), backup = store.migrationBackupPath; expect(store.route()).toMatchObject({ conversationId: null, contextToken: null }); expect(store.control().enabled).toBe(false); expect(store.checkpointState("multi-cp")).toBe("CANCELLED"); expect(store.pendingState("multi-wait")).toBe("UNKNOWN"); expect(store.state("multi-wait")).toBe("UNKNOWN"); expect((store.db.query("SELECT reason FROM inbound WHERE message_id='multi-wait'").get() as any).reason).toBe("migration-multiple-global-routes"); expect((store.db.query("SELECT running,origin FROM session_activity WHERE root_session_id='root-a'").get() as any)).toMatchObject({ running: 0, origin: "NONE" }); expect((store.db.query("SELECT reason FROM audit WHERE reason='migration-multiple-global-routes'").get() as any).reason).toBe("migration-multiple-global-routes"); expect(store.bind({ rootSessionId: "root-c", directory: "c", ownerInstance: "owner-c" })).toMatchObject({ alias: 3, registrationAlias: 10 })
 	store.close(); writer.close(); cleanup(filename, backup)
 })
 
 test("old deployed v3 receives a pre-v5 snapshot and preserves control/pending/checkpoint data", () => {
 	const filename = tempFile("wal-v3"), writer = createWalV3(filename), store = new Store(filename), backup = store.migrationBackupPath
-	expect(backup).toContain("pre-v5"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6); expect(store.bindingForAlias(4)?.rootSessionId).toBe("root-v3"); expect(store.control()).toEqual({ enabled: true, revision: 17 }); expect(store.pendingState("in-v3")).toBe("UNKNOWN"); expect(store.checkpointState("cp-v3")).toBe("CANCELLED"); expect(store.checkpointForRequest("cp-v3", "root-v3")?.checkpointId).toBe("cp-v3")
+	expect(backup).toContain("pre-v5"); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect(store.bindingForRoot("root-v3")).toMatchObject({ alias: 1, registrationAlias: 4 }); expect(store.control()).toEqual({ enabled: true, revision: 17 }); expect(store.pendingState("in-v3")).toBe("UNKNOWN"); expect(store.checkpointState("cp-v3")).toBe("CANCELLED"); expect(store.checkpointForRequest("cp-v3", "root-v3")?.checkpointId).toBe("cp-v3")
 	const snapshot = new Database(backup!); expect((snapshot.query("PRAGMA user_version").get() as any).user_version).toBe(3); expect((snapshot.query("SELECT revision FROM control_state").get() as any).revision).toBe(17); expect((snapshot.query("SELECT state FROM pending_replies WHERE inbound_id='in-v3'").get() as any).state).toBe("UNKNOWN"); expect((snapshot.query("SELECT state FROM checkpoints WHERE checkpoint_id='cp-v3'").get() as any).state).toBe("UNKNOWN"); snapshot.close()
 	store.close(); writer.close(); const reopened = new Store(filename); expect(reopened.migrationBackupPath).toBeUndefined(); expect(reopened.control().revision).toBe(17); reopened.close(); cleanup(filename, backup)
 })
@@ -313,8 +400,8 @@ test("leave-root RPC verifies exact root and allocates or refreshes registration
 test("explicit not-root health and runtime observations deactivate only their binding", async () => {
 	const store = new Store(":memory:"), adapter = new MockWeChatAdapter(); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "Root" })
 	const broker = new BrokerService(store, adapter, "secret", "worker", async (url) => Response.json({ error: "not-root" }, { status: 409 }))
-	const observed = await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); expect(await observed.json()).toMatchObject({ observed: false }); expect(store.bindingForRoot("root")?.active).toBe(false)
-	store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "Again" }); const leave = await broker.handleRequest(authenticatedRequest("leave-root", { rootSessionId: "root", directory: "d", title: "No longer root" })); expect(leave.status).toBe(409); expect(store.bindingForRoot("root")?.active).toBe(false); expect(store.bindingForRoot("root")?.alias).toBe(1)
+	const observed = await broker.handleRequest(authenticatedRequest("observe-status", { rootSessionId: "root", status: "busy" })); expect(await observed.json()).toMatchObject({ observed: false }); expect(store.bindingForRoot("root")).toBeUndefined()
+	store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "Again" }); const leave = await broker.handleRequest(authenticatedRequest("leave-root", { rootSessionId: "root", directory: "d", title: "No longer root" })); expect(leave.status).toBe(409); expect(store.bindingForRoot("root")).toBeUndefined(); expect((store.db.query("SELECT alias FROM bindings WHERE root_session_id='root'").get() as any).alias).toBe(1)
 	store.close()
 })
 
@@ -554,12 +641,21 @@ test("plugin implementation remains metadata-only and adapter command is configu
 	expect(resolveWeixinCommand(["node", path.resolve("custom", "weixin-mcp", "dist", "cli.js")])[0]).toBe("node"); expect(() => resolveWeixinCommand(["npx", "weixin-mcp"])).toThrow()
 })
 
-test("clean schema v6 has bounded state tables, metadata and AUTOINCREMENT holes", () => {
+test("clean schema v7 has bounded state tables, metadata and AUTOINCREMENT holes", () => {
 	const store = new Store(":memory:")
-	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(6); expect((store.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("6")
+	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect((store.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("7")
 	for (const table of ["prompt_submissions", "native_requests", "root_runtime", "typing_state"]) expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)).toBeDefined()
-	store.bind({ rootSessionId: "one", directory: "d", ownerInstance: "o" }); store.bind({ rootSessionId: "hole", directory: "d", ownerInstance: "o" }); store.db.query("DELETE FROM bindings WHERE root_session_id='hole'").run(); expect(store.bind({ rootSessionId: "three", directory: "d", ownerInstance: "o" }).alias).toBe(3)
+	store.bind({ rootSessionId: "one", directory: "d", ownerInstance: "o" }); store.bind({ rootSessionId: "hole", directory: "d", ownerInstance: "o" }); store.db.query("DELETE FROM bindings WHERE root_session_id='hole'").run(); expect(store.bind({ rootSessionId: "three", directory: "d", ownerInstance: "o" })).toMatchObject({ alias: 2, registrationAlias: 3 })
 	expect(() => store.db.query("UPDATE typing_state SET desired=2").run()).toThrow(); store.close()
+})
+
+test("existing schema v7 idempotently creates native answer guard storage", () => {
+	const filename = tempFile("v7-native-answer-guards"); let store = new Store(filename)
+	store.db.exec("DROP TABLE native_answer_guards"); store.close(); store = new Store(filename)
+	expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7)
+	expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_answer_guards'").get()).toBeDefined()
+	expect(store.db.query("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_native_answer_guard_request'").get()).toBeDefined()
+	store.close(); cleanup(filename)
 })
 
 test("v5 to v6 snapshot preserves history and cancels only active legacy work without replay", () => {
@@ -580,11 +676,30 @@ test("prompt claims enforce legal conditional transitions and back uses pre-call
 	expect(store.claimPromptSubmission({ submissionId: "during", inboundId: "in-during", root: "root", owner: "owner", alias: 1, messageId: "msg-during", body: "x" })).toBeDefined(); expect(store.markPromptCallStarted("during")).toBe(true); expect(store.claimPromptSubmission({ submissionId: "collision", inboundId: "in-during", root: "root", owner: "owner", alias: 1, messageId: "another-message", body: "x" })).toBeUndefined(); store.setControl(false); expect(store.promptSubmission("before")?.state).toBe("CANCELLED"); expect(store.promptSubmission("during")?.state).toBe("UNKNOWN"); store.close()
 })
 
-test("native requests allocate deterministic codes, never retry UNKNOWN, settle terminals and expose precedence", () => {
+test("native requests use root identity independent of copied aliases", () => {
 	const occupied = new Set<string>(), first = allocateRequestCode("QUESTION", "same", (code) => occupied.has(code)); occupied.add(first); const second = allocateRequestCode("QUESTION", "same", (code) => occupied.has(code)); expect(first).toMatch(/^Q[A-Z2-7]{6}$/); expect(second).not.toBe(first)
-	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); expect(store.nativeQuery(1)).toEqual({ kind: "NONE" })
-	const one = store.openNativeRequest({ requestId: "one", requestKey: "key-one", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: { questions: [["A"]] } })!; expect(one.state).toBe("ANNOUNCING"); expect(store.finishNativeAnnouncement("one", false)).toBe(true); expect(store.nativeRequest("one")?.state).toBe("OPEN"); expect(store.nativeQuery(1).kind).toBe("ONE"); expect(store.claimNativeResolution("one", "answer")).toBe(true); expect(store.finishNativeResolution("one", "UNKNOWN")).toBe(true); expect(store.claimNativeResolution("one", "retry")).toBe(false)
-	store.openNativeRequest({ requestId: "two", requestKey: "key-two", root: "root", owner: "owner", alias: 1, kind: "PERMISSION", payload: { permission: "write" } }); expect(store.finishNativeAnnouncement("two", true)).toBe(true); expect(store.nativeQuery(1).kind).toBe("MULTIPLE"); expect(store.claimNativeResolution("two", "answer")).toBe(false); expect(store.settleNativeTerminal("one", "RESOLVED", [["A"]])).toBe(true); expect(store.nativeRequest("one")?.state).toBe("RESOLVED"); expect(store.settleNativeTerminal("one", "REJECTED")).toBe(false); expect(store.settleNativeTerminal("two", "REJECTED", "reject")).toBe(true); expect(store.nativeQuery(1).kind).toBe("NONE"); store.close()
+	const store = new Store(":memory:"); store.bind({ rootSessionId: "earlier", directory: "d", ownerInstance: "owner" }); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" }); expect(store.nativeQuery("root")).toEqual({ kind: "NONE" })
+	const one = store.openNativeRequest({ requestId: "one", requestKey: "key-one", root: "root", owner: "owner", alias: 2, kind: "QUESTION", payload: { questions: [["A"]] } })!; expect(one.state).toBe("ANNOUNCING"); expect(store.finishNativeAnnouncement("one", false)).toBe(true); expect(store.nativeQuery("root").kind).toBe("ONE"); expect(store.nativeQuery("earlier")).toEqual({ kind: "NONE" })
+	store.deactivateBinding("earlier", "owner"); expect(store.bindingForRoot("root")?.alias).toBe(1); expect(store.nativeQuery("root").kind).toBe("ONE")
+	expect(store.nativeRequestReplay({ requestKey: "key-one", requestId: "one", root: "root", owner: "owner", kind: "QUESTION", payload: { questions: [["A"]] }, controlRevision: one.controlRevision })).toMatchObject({ result: "EXACT" })
+	expect(store.nativeRequestReplay({ requestKey: "key-one", requestId: "one", root: "earlier", owner: "owner", kind: "QUESTION", payload: { questions: [["A"]] }, controlRevision: one.controlRevision })).toEqual({ result: "MISMATCH" })
+	expect(store.claimNativeResolution("one", "answer")).toBe(true); expect(store.finishNativeResolution("one", "UNKNOWN")).toBe(true); expect(store.claimNativeResolution("one", "retry")).toBe(false)
+	store.openNativeRequest({ requestId: "two", requestKey: "key-two", root: "root", owner: "owner", alias: 1, kind: "PERMISSION", payload: { permission: "write" } }); expect(store.finishNativeAnnouncement("two", true)).toBe(true); expect(store.nativeQuery("root").kind).toBe("MULTIPLE"); expect(store.claimNativeResolution("two", "answer")).toBe(false); expect(store.settleNativeTerminal("one", "RESOLVED", [["A"]])).toBe(true); expect(store.settleNativeTerminal("two", "REJECTED", "reject")).toBe(true); expect(store.nativeQuery("root").kind).toBe("NONE"); store.close()
+})
+
+test("native answer guards are root scoped and cleared by inactive lifecycle transitions", () => {
+	const store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "a", directory: "d", ownerInstance: "owner" }); store.bind({ rootSessionId: "b", directory: "d", ownerInstance: "owner" })
+	for (const [root, id, alias] of [["a", "guard-a", 1], ["b", "guard-b", 2]] as const) { store.openNativeRequest({ requestId: id, requestKey: id, root, owner: "owner", alias, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement(id, true); expect(store.recordNativeAnswerGuard(root, id)).toBe(true) }
+	expect(store.consumeNativeAnswerGuard("a", "guard-b")).toBe(false); expect(store.consumeNativeAnswerGuard("a", "guard-a")).toBe(true); expect(store.consumeNativeAnswerGuard("a", "guard-a")).toBe(false)
+	expect(store.recordNativeAnswerGuard("a", "guard-a")).toBe(true); expect(store.deactivateBinding("a", "owner")).toBe(true); expect(store.consumeNativeAnswerGuard("a", "guard-a")).toBe(false); expect(store.consumeNativeAnswerGuard("b", "guard-b")).toBe(true)
+	expect(store.recordNativeAnswerGuard("b", "guard-b")).toBe(true); expect(store.settleNativeTerminal("guard-b", "RESOLVED")).toBe(true); expect(store.consumeNativeAnswerGuard("b", "guard-b")).toBe(false)
+	store.close()
+})
+
+test("native answer guards clear on unregister and control shutdown", () => {
+	const store = new Store(":memory:"); store.register("owner", "token", "http://127.0.0.1:1"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner" })
+	store.openNativeRequest({ requestId: "guard", requestKey: "guard", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} }); store.finishNativeAnnouncement("guard", true); expect(store.recordNativeAnswerGuard("root", "guard")).toBe(true); expect(store.unregister("owner", "token")).toBe(true); expect(store.consumeNativeAnswerGuard("root", "guard")).toBe(false)
+	store.register("owner", "token", "http://127.0.0.1:1"); expect(store.recordNativeAnswerGuard("root", "guard")).toBe(true); store.setControl(false); expect(store.consumeNativeAnswerGuard("root", "guard")).toBe(false); expect((store.db.query("PRAGMA user_version").get() as any).user_version).toBe(7); expect(store.db.query("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_native_answer_guard_request'").get()).toBeDefined(); store.close()
 })
 
 test("uncertain native relay stays OPEN and resolves remotely without relay retry", () => {
@@ -626,6 +741,6 @@ test("queued active admissions are maintenance snapshots and authoritative idle 
 test("deactivation atomically cancels owned work and cannot affect reactivation", () => {
 	const store = new Store(":memory:"); store.bind({ rootSessionId: "root", directory: "d", ownerInstance: "owner", title: "History" }); store.refreshRoute("recipient", "ctx")
 	store.claimPromptSubmission({ submissionId: "prompt", inboundId: "in", root: "root", owner: "owner", alias: 1, body: "x" }); store.beginRuntimeAdmission("prompt", "root", "owner", 100, 1000); store.markPromptCallStarted("prompt"); store.openNativeRequest({ requestId: "native", requestKey: "native", root: "root", owner: "owner", alias: 1, kind: "QUESTION", payload: {} })
-	expect(store.deactivateBinding("root", "owner")).toBe(true); expect(store.bindingForRoot("root")).toMatchObject({ alias: 1, title: "History", active: false }); expect(store.promptSubmission("prompt")).toMatchObject({ state: "UNKNOWN", admissionFinished: true }); expect(store.nativeRequest("native")?.state).toBe("CANCELLED_REMOTE"); expect(store.runtime("root")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.typingDesired()).toBe(false); expect(store.deactivateBinding("root", "owner")).toBe(false)
+	expect(store.deactivateBinding("root", "owner")).toBe(true); expect(store.bindingForRoot("root")).toBeUndefined(); expect((store.db.query("SELECT alias,title,active FROM bindings WHERE root_session_id='root'").get() as any)).toMatchObject({ alias: 1, title: "History", active: 0 }); expect(store.promptSubmission("prompt")).toMatchObject({ state: "UNKNOWN", admissionFinished: true }); expect(store.nativeRequest("native")?.state).toBe("CANCELLED_REMOTE"); expect(store.runtime("root")).toMatchObject({ status: "IDLE", workPending: false }); expect(store.typingDesired()).toBe(false); expect(store.deactivateBinding("root", "owner")).toBe(false)
 	store.bind({ rootSessionId: "root", directory: "new", ownerInstance: "owner", title: "Again" }); store.claimPromptSubmission({ submissionId: "new", inboundId: "new-in", root: "root", owner: "owner", alias: 1, body: "new" }); const generation = store.beginRuntimeAdmission("new", "root", "owner", 200, 1000)!; expect(store.deactivateBinding("root", "other")).toBe(false); expect(store.finishRuntimeAdmission("prompt", "root", "owner")).toBe(true); expect(store.rejectPromptSubmissionNoEffect("prompt", "root", "owner")).toBe(false); expect(store.runtime("root")).toMatchObject({ generation, status: "QUEUED", admissionCount: 1, workPending: true }); store.close()
 })

@@ -172,7 +172,7 @@ export const WeChatControlPlugin: Plugin = async ({ client, directory, serverUrl
 		},
 		"experimental.chat.system.transform": async (input: any, output: { system: string[] }) => {
 			if (!input.sessionID) return
-			try { const rootSessionId = await root(input.sessionID), status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); if (status.enabled && status.routable) output.system.push("当前处于受限微信接管。仅在明确需要时调用 wechat_reply({text}) 向微信发送文字；不要自动复述助手内容。Question/Permission 请求会由系统转发到微信并等待后续回答。") } catch {}
+			try { const rootSessionId = await root(input.sessionID), status = await rpc(worker.endpoint, worker.secret, { method: "control-get", ...auth, rootSessionId }); if (status.enabled && status.routable) output.system.push("当前处于受限微信接管。仅在明确需要时调用 wechat_reply({text}) 向微信发送文字；不要自动复述助手内容。Question/Permission 请求会由系统转发到微信；微信答案必须使用当前 id 映射，并在一条消息中发送 #N\\nQCODE 1，单个问题也可发送 #N\\n1。") } catch {}
 		},
 		"permission.ask": permissionHook,
 		event: eventHook,

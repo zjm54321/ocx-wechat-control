@@ -14,8 +14,8 @@ const MAX_NATIVE_OPTIONS = 32
 const MAX_NATIVE_FIELD = 1000
 const NATIVE_PROCESSING_TEXT = "该请求正在处理中，请勿重复提交。"
 const NATIVE_UNKNOWN_TEXT = "该请求状态不确定，请在 OpenCode 本地界面处理。"
-const NATIVE_INVALID_TEXT = "请求编号无效、已过期或不属于该会话。"
-const NATIVE_USAGE_TEXT = "答案格式无效，请按请求中的选项和编号重新回复。"
+const NATIVE_INVALID_TEXT = "请求编号无效或已过期，请按当前会话的请求重新回复。"
+const NATIVE_CROSS_ROOT_TEXT = "该请求属于另一个当前会话；请使用对应的会话编号和请求编号。"
 
 export function clampCallbackTimeout(value?: number): number { return Math.min(MAX_CALLBACK_TIMEOUT_MS, Math.max(MIN_CALLBACK_TIMEOUT_MS, value ?? DEFAULT_CALLBACK_TIMEOUT_MS)) }
 export interface BrokerOptions { callbackTimeoutMs?: number; typing?: TypingCoordinator; workerMetadata?: WorkerMetadata }
@@ -98,15 +98,26 @@ function requestCode(body: string): { code: string; answer: string } | undefined
 	return { code: match[1], answer: body.slice(match[0].length) }
 }
 
-function nativeRelayText(request: NativeRequest): string | undefined {
+function nativeAnswerUsage(request: NativeRequest, alias: number): string {
+	if (request.kind === "PERMISSION") return `答案格式无效。请一次性回复 #${alias}\n${request.code} once 或 #${alias}\n${request.code} reject；仅接受 once 或 reject。`
+	const payload = parseQuestionPayload(request.payload)
+	if (!payload) return "答案格式无效，请按请求中的选项和编号重新回复。"
+	if (payload.questions.length === 1) {
+		const options = payload.questions[0].options.map((option, index) => `${index + 1}=${option.label}`).join("、")
+		return `答案格式无效。请一次性回复 #${alias}\n${request.code} 1，或 #${alias}\n1。可选：${options || "允许自定义"}`
+	}
+	return `答案格式无效。请一次性回复 #${alias}\n${request.code} 后按“问题序号: 答案”逐行填写；不能拆成多条消息。`
+}
+
+function nativeRelayText(request: NativeRequest, alias: number): string | undefined {
 	if (request.kind === "PERMISSION") {
 		const payload = parsePermissionPayload(request.payload); if (!payload) return
-		return `${request.code} 权限请求\n${payload.permission}\n回复 once 或 reject。`
+		return `${request.code} 权限请求\n${payload.permission}\n请一次性回复 #${alias}\n${request.code} once 或 #${alias}\n${request.code} reject；仅接受 once 或 reject。`
 	}
 	const payload = parseQuestionPayload(request.payload); if (!payload) return
 	const lines = [`${request.code} 问题请求`]
-	payload.questions.forEach((question, index) => { lines.push(`${payload.questions.length > 1 ? `${index + 1}: ` : ""}${question.question}`); question.options.forEach((option, optionIndex) => lines.push(`${optionIndex + 1}. ${option.label}`)) })
-	lines.push(payload.questions.length > 1 ? `回复 ${request.code} 后按“N: 答案”逐行填写。` : `回复 ${request.code} 后填写答案。`)
+	payload.questions.forEach((question, index) => { if (index > 0) lines.push(""); lines.push(`${payload.questions.length > 1 ? `${index + 1}: ` : ""}${question.question}`); question.options.forEach((option, optionIndex) => lines.push(`${optionIndex + 1}. ${option.label}`)) })
+	lines.push(payload.questions.length > 1 ? `请一次性回复 #${alias}\n${request.code} 后按“N: 答案”逐行填写。` : `请一次性回复 #${alias}\n${request.code} 1，或 #${alias}\n1。`)
 	const text = lines.join("\n"); return isPlainText(text) ? text : undefined
 }
 
@@ -231,12 +242,18 @@ export class BrokerService {
 		const explicit = requestCode(parsed.body)
 		if (explicit) {
 			const native = this.store.nativeRequest(explicit.code)
-			if (!native || native.alias !== binding.alias || !this.store.activeNativeRequests(binding.alias).some((item) => item.requestId === native.requestId)) return this.nativeNotice(message, "native-invalid", NATIVE_INVALID_TEXT, "native-code-invalid")
+			if (!native) return this.nativeNotice(message, "native-invalid", NATIVE_INVALID_TEXT, "native-code-invalid")
+			if (native.rootSessionId !== binding.rootSessionId) return this.nativeNotice(message, "native-cross-root", NATIVE_CROSS_ROOT_TEXT, "native-code-cross-root")
+			if (!this.store.activeNativeRequests(binding.rootSessionId).some((item) => item.requestId === native.requestId)) return this.nativeNotice(message, "native-invalid", NATIVE_INVALID_TEXT, "native-code-invalid")
+			if (!explicit.answer) this.store.recordNativeAnswerGuard(binding.rootSessionId, native.requestId)
 			return this.resolveNative(message, binding, instance, native, explicit.answer)
 		}
-		const query = this.store.nativeQuery(binding.alias)
-		if (query.kind === "ONE") return this.resolveNative(message, binding, instance, query.request, parsed.body)
-		if (query.kind === "MULTIPLE") return this.nativeNotice(message, "native-choices", `存在多个待处理请求，请在答案前填写编号：\n${query.requests.map((item) => item.code).join("\n")}`, "native-code-required")
+		const query = this.store.nativeQuery(binding.rootSessionId)
+		if (query.kind === "ONE") {
+			if (this.store.consumeNativeAnswerGuard(binding.rootSessionId, query.request.requestId)) return this.nativeNotice(message, "native-usage", nativeAnswerUsage(query.request, binding.alias), "native-answer-invalid")
+			return this.resolveNative(message, binding, instance, query.request, parsed.body)
+		}
+		if (query.kind === "MULTIPLE") return this.nativeNotice(message, "native-choices", `存在多个待处理请求，请一次性回复 #${binding.alias}\n请求编号和答案：\n${query.requests.map((item) => item.code).join("\n")}`, "native-code-required")
 		return this.admitPrompt(message, binding, instance, parsed.body)
 	}
 
@@ -245,15 +262,17 @@ export class BrokerService {
 			const control = this.store.control()
 			const currentBinding = this.store.bindingForRoot(binding.rootSessionId)
 			if (!control.enabled || !currentBinding?.active || currentBinding.ownerInstance !== binding.ownerInstance) { this.store.markUnknown(message.id, "control-changed-before-admission"); return { ok: false, reason: "control-disabled" } }
-			const submission = this.store.claimPromptSubmission({ submissionId: message.id, inboundId: message.id, root: binding.rootSessionId, owner: binding.ownerInstance, alias: binding.alias, body: text, revision: control.revision })
+			const currentInstance = this.store.instance(currentBinding.ownerInstance)
+			if (!currentInstance?.online) { this.store.markUnknown(message.id, "owner-offline-before-admission"); return { ok: false, reason: "owner-offline" } }
+			const submission = this.store.claimPromptSubmission({ submissionId: message.id, inboundId: message.id, root: currentBinding.rootSessionId, owner: currentBinding.ownerInstance, alias: currentBinding.alias, body: text, revision: control.revision })
 			if (!submission || submission.state !== "SUBMITTING" || this.store.beginRuntimeAdmission(message.id, binding.rootSessionId, binding.ownerInstance) === undefined) { this.store.markUnknown(message.id, "prompt-claim-failed"); return { ok: false, reason: "prompt-claim-failed" } }
 			const messageId = submission.messageId
 			this.refreshTyping()
 			if (!this.store.markPromptCallStarted(message.id)) { this.store.finishRuntimeAdmission(message.id, binding.rootSessionId, binding.ownerInstance); this.store.markUnknown(message.id, "prompt-call-cancelled"); return { ok: false, reason: "prompt-call-cancelled" } }
 			try {
-				const response = await this.fetcher(`${instance.endpoint}/submit-prompt`, { method: "POST", headers: callbackHeaders(this.sharedSecret, instance.instanceToken), body: JSON.stringify({ rootSessionId: binding.rootSessionId, directory: binding.directory, inboundId: message.id, messageId, text }), signal: AbortSignal.timeout(this.callbackTimeoutMs) })
+				const response = await this.fetcher(`${currentInstance.endpoint}/submit-prompt`, { method: "POST", headers: callbackHeaders(this.sharedSecret, currentInstance.instanceToken), body: JSON.stringify({ rootSessionId: currentBinding.rootSessionId, directory: currentBinding.directory, inboundId: message.id, messageId, text }), signal: AbortSignal.timeout(this.callbackTimeoutMs) })
 				let result: JsonObject | undefined; try { result = object(await response.json()) } catch {}
-				if (response.ok && result?.ok === true && result.accepted === true) { if (this.store.finishPromptSubmission(message.id, "SUBMITTED", messageId) && this.store.controlMatches(control.revision)) { this.store.finishInboundAdmission(message.id, binding.rootSessionId, messageId); return { ok: true } }; this.store.markUnknown(message.id, "control-changed-after-admission"); return { ok: false, reason: "control-changed-after-admission" } }
+				if (response.ok && result?.ok === true && result.accepted === true) { const afterBinding = this.store.bindingForRoot(binding.rootSessionId); if (afterBinding?.active && afterBinding.ownerInstance === binding.ownerInstance && this.store.finishPromptSubmission(message.id, "SUBMITTED", messageId) && this.store.controlMatches(control.revision)) { this.store.finishInboundAdmission(message.id, binding.rootSessionId, messageId); return { ok: true } }; this.store.markUnknown(message.id, "control-changed-after-admission"); return { ok: false, reason: "control-changed-after-admission" } }
 				if (result?.certainty === "REJECTED") { this.store.rejectPromptSubmissionNoEffect(message.id, binding.rootSessionId, binding.ownerInstance, typeof result.error === "string" ? result.error : undefined); if (result.error === "not-root") this.store.deactivateBinding(binding.rootSessionId, binding.ownerInstance); this.store.markUnknown(message.id, "prompt-rejected-no-effect"); return { ok: false, reason: "prompt-rejected" } }
 				this.store.finishPromptSubmission(message.id, "UNKNOWN"); this.store.markUnknown(message.id, "prompt-admission-uncertain"); return { ok: false, reason: "unknown-no-replay" }
 			} catch { this.store.finishPromptSubmission(message.id, "UNKNOWN"); this.store.markUnknown(message.id, "prompt-admission-uncertain"); return { ok: false, reason: "unknown-no-replay" } } finally { this.store.finishRuntimeAdmission(message.id, binding.rootSessionId, binding.ownerInstance); this.refreshTyping() }
@@ -261,17 +280,21 @@ export class BrokerService {
 	}
 
 	private async resolveNative(message: WeixinInbound, binding: Binding, instance: { endpoint: string; instanceToken: string }, native: NativeRequest, answerBody: string): Promise<{ ok: boolean; reason?: string }> {
+		const currentBinding = this.store.bindingForRoot(binding.rootSessionId)
+		if (!currentBinding?.active || currentBinding.ownerInstance !== binding.ownerInstance) return this.nativeNotice(message, "native-inactive", "该会话已不再活动，请使用当前 id 列表。", "native-session-inactive")
+		instance = this.store.instance(currentBinding.ownerInstance) ?? instance
+		binding = currentBinding
 		if (native.state === "RESOLVING" || native.state === "ANNOUNCING") return this.nativeNotice(message, "native-processing", NATIVE_PROCESSING_TEXT, "native-processing")
 		if (native.state === "UNKNOWN") return this.nativeNotice(message, "native-local", NATIVE_UNKNOWN_TEXT, "native-unknown-local")
 		if (native.state !== "OPEN") return this.nativeNotice(message, "native-invalid", NATIVE_INVALID_TEXT, "native-code-invalid")
 		let callbackPath: string, callbackBody: JsonObject, resolution: unknown, terminal: "RESOLVED" | "REJECTED" = "RESOLVED"
 		if (native.kind === "QUESTION") {
 			const payload = parseQuestionPayload(native.payload), parsed = payload && parseQuestionAnswers(payload, answerBody)
-			if (!payload || !parsed) return this.nativeNotice(message, "native-usage", NATIVE_USAGE_TEXT, "native-answer-invalid")
+			if (!payload || !parsed) return this.nativeNotice(message, "native-usage", nativeAnswerUsage(native, binding.alias), "native-answer-invalid")
 			callbackPath = "/resolve-question"; resolution = parsed; callbackBody = { rootSessionId: binding.rootSessionId, sourceSessionId: payload.sourceSessionId, requestId: native.requestId, directory: binding.directory, answers: parsed }
 		} else {
 			const payload = parsePermissionPayload(native.payload)
-			if (!payload || (answerBody !== "once" && answerBody !== "reject")) return this.nativeNotice(message, "native-usage", NATIVE_USAGE_TEXT, "native-answer-invalid")
+			if (!payload || (answerBody !== "once" && answerBody !== "reject")) return this.nativeNotice(message, "native-usage", nativeAnswerUsage(native, binding.alias), "native-answer-invalid")
 			callbackPath = "/resolve-permission"; resolution = answerBody; terminal = answerBody === "reject" ? "REJECTED" : "RESOLVED"; callbackBody = { rootSessionId: binding.rootSessionId, sourceSessionId: payload.sourceSessionId, requestId: native.requestId, directory: binding.directory, decision: answerBody }
 		}
 		if (!this.store.claimNativeResolution(native.requestId, message.id)) return this.nativeNotice(message, "native-race", NATIVE_PROCESSING_TEXT, "native-resolution-race")
@@ -291,14 +314,14 @@ export class BrokerService {
 		const control = this.store.control(), route = this.store.route(), payload = kind === "QUESTION" ? parseQuestionPayload(body.payload) : parsePermissionPayload(body.payload)
 		if (!control.enabled || !route.conversationId || !route.contextToken || this.adapter.status() !== "Ready" || !payload) return Response.json({ error: "invalid-native-request" }, { status: 409 })
 		try { boundedJson(payload) } catch { return Response.json({ error: "invalid-native-request" }, { status: 400 }) }
-		const replay = this.store.nativeRequestReplay({ requestKey: body.requestKey, requestId: body.requestId, root: binding.rootSessionId, owner: binding.ownerInstance, alias: binding.alias, kind: kind as NativeRequestKind, payload, controlRevision: control.revision })
+		const replay = this.store.nativeRequestReplay({ requestKey: body.requestKey, requestId: body.requestId, root: binding.rootSessionId, owner: binding.ownerInstance, kind: kind as NativeRequestKind, payload, controlRevision: control.revision })
 		if (replay.result === "EXACT") return Response.json({ ok: true, replayed: true, request: replay.request })
 		if (replay.result === "MISMATCH") return Response.json({ error: "native-request-conflict" }, { status: 409 })
 		const opened = this.store.openNativeRequest({ requestId: body.requestId, requestKey: body.requestKey, root: binding.rootSessionId, owner: binding.ownerInstance, alias: binding.alias, kind: kind as NativeRequestKind, payload, revision: control.revision })
 		if (!opened) return Response.json({ error: "native-request-conflict" }, { status: 409 })
-		const text = nativeRelayText(opened), formatted = text ? formatOutbound(binding.alias, text) : undefined
+		const currentBinding = this.store.bindingForRoot(binding.rootSessionId), text = currentBinding ? nativeRelayText(opened, currentBinding.alias) : undefined, formatted = text && currentBinding ? formatOutbound(currentBinding.alias, text) : undefined
 		if (!formatted || formatted.length > 4000) { this.store.finishNativeAnnouncement(opened.requestId, false); return Response.json({ ok: false, state: "OPEN", relay: "UNKNOWN", request: this.store.nativeRequest(opened.requestId) }) }
-		const sent = await this.sendControl(binding, `native-relay:${body.requestKey}`, "native-request", formatted, control.revision)
+		const sent = await this.sendControl(currentBinding!, `native-relay:${body.requestKey}`, "native-request", formatted, control.revision)
 		this.store.finishNativeAnnouncement(opened.requestId, sent)
 		return Response.json({ ok: true, state: "OPEN", relay: sent ? "SENT" : "UNKNOWN", request: this.store.nativeRequest(opened.requestId) })
 	}
@@ -315,9 +338,11 @@ export class BrokerService {
 	private async wechatReply(body: JsonObject): Promise<Response> {
 		const binding = validId(body.rootSessionId) ? this.store.bindingForRoot(body.rootSessionId) : undefined, route = this.store.route()
 		if (!binding?.active || binding.ownerInstance !== body.instanceId || !validId(body.callId) || !boundedText(body.text, 4000) || !this.store.control().enabled || !route.conversationId || !route.contextToken || this.adapter.status() !== "Ready") return Response.json({ error: "reply-unavailable" }, { status: 409 })
-		const dedupeKey = `wechat-reply:${binding.rootSessionId}:${body.callId}`, payload = formatOutbound(binding.alias, body.text), claim = this.store.claimControlOutbound({ dedupeKey, root: binding.rootSessionId, kind: "wechat-reply", payload, revision: this.store.control().revision })
-		if (!claim) { if (this.store.controlOutboundPayload(dedupeKey) !== payload) return Response.json({ error: "reply-call-conflict" }, { status: 409 }); const state = this.store.controlOutboundState(dedupeKey); this.reassertTyping(); return Response.json({ ok: state === "SENT", state: state ?? "UNKNOWN", replayed: true }) }
-		await this.dispatchControl(claim.outboundId, claim.binding, claim.binding.conversationId ? formatOutbound(binding.alias, body.text) : body.text)
+		const dedupeKey = `wechat-reply:${binding.rootSessionId}:${body.callId}`, payload = formatOutbound(binding.alias, body.text), claim = this.store.claimControlOutbound({ dedupeKey, root: binding.rootSessionId, kind: "wechat-reply", payload, logicalText: body.text, revision: this.store.control().revision })
+		if (!claim) return Response.json({ error: "reply-unavailable" }, { status: 409 })
+		if (claim.result === "REPLAY") { this.reassertTyping(); return Response.json({ ok: claim.state === "SENT", state: claim.state, replayed: true }) }
+		if (claim.result === "CONFLICT") return Response.json({ error: "reply-call-conflict" }, { status: 409 })
+		await this.dispatchControl(claim.outboundId, claim.binding, payload)
 		const state = this.store.controlOutboundState(`wechat-reply:${binding.rootSessionId}:${body.callId}`)
 		this.reassertTyping()
 		return Response.json({ ok: state === "SENT", state: state ?? "UNKNOWN", replayed: false }, { status: state === "SENT" ? 200 : 409 })

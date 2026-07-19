@@ -23,3 +23,4 @@ login/
 qr/
 cache/
 tmp/
+.slim/deepwork/
